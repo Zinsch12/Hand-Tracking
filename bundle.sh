@@ -121,8 +121,9 @@ class GestureService : AccessibilityService() {
     companion object {
         @Volatile var inst: GestureService? = null
         fun tap(x: Float, y: Float) { inst?.gesture(x, y, x, y, 50) }
-        fun scroll(down: Boolean, w: Int, h: Int) {
-            val cx = w / 2f; val a = h * .65f; val b = h * .35f
+        fun swipe(x1: Float, y1: Float, x2: Float, y2: Float, dur: Long) { inst?.gesture(x1, y1, x2, y2, dur) }
+        fun scroll(down: Boolean, w: Int, h: Int, frac: Float = .3f) {
+            val cx = w / 2f; val a = h * (.5f + frac / 2); val b = h * (.5f - frac / 2)
             if (down) inst?.gesture(cx, a, cx, b, 200) else inst?.gesture(cx, b, cx, a, 200)
         }
     }
@@ -220,6 +221,15 @@ class HandService : LifecycleService() {
     private var lastScrollT = 0L
     private var lastTs = 0L
     private var lostAt = 0L
+    private var wasScroll = false
+    private var dragged = false
+    private var ox = 0f
+    private var oy = 0f
+    private var dragX = 0f
+    private var dragY = 0f
+    private var lastDragT = 0L
+    private var scrollArmAt = 0L
+    private var anchorY = -1f
     private var mode = "gerak"
     private var cand = "gerak"
     private var candN = 0
@@ -353,7 +363,7 @@ class HandService : LifecycleService() {
 
     private fun vote(m: String): String {
         if (m == mode) { candN = 0; return mode }
-        if (m == cand) { if (++candN >= 3) { mode = m; candN = 0 } } else { cand = m; candN = 1 }
+        if (m == cand) { if (++candN >= (if (m == "gulir") 6 else 3)) { mode = m; candN = 0 } } else { cand = m; candN = 1 }
         return mode
     }
 
@@ -366,21 +376,26 @@ class HandService : LifecycleService() {
         }
         lostAt = 0L
         val idx = ext(l, 8, 6); val mid = ext(l, 12, 10); val rng = ext(l, 16, 14); val pky = ext(l, 20, 18)
-        val raw = if (!idx && !mid && !rng && !pky) "jeda" else if (idx && mid && !rng && !pky) "gulir" else "gerak"
+        val raw = if (!idx && !rng && !pky) "jeda" else if (idx && mid && !rng && !pky) "gulir" else "gerak"
         val m = vote(raw)
 
-        if (m == "jeda") { lastY = -1f; paint(Color.GRAY, false); return }
+        if (m == "jeda") { lastY = -1f; wasScroll = false; pinched = false; paint(Color.GRAY, false); return }
 
         if (m == "gulir") {
+            pinched = false
             val y = (l[8].y() + l[12].y()) / 2f
-            if (lastY >= 0) {
-                scrollAcc += (y - lastY) * sh * 3f
-                if (abs(scrollAcc) > 120 && now - lastScrollT > 250) {
-                    GestureService.scroll(scrollAcc > 0, sw, sh); scrollAcc = 0f; lastScrollT = now
+            if (!wasScroll) { wasScroll = true; scrollArmAt = now + 350; anchorY = -1f }
+            if (now >= scrollArmAt) {
+                if (anchorY < 0) anchorY = y
+                val diff = y - anchorY            // tahan tangan di atas/bawah titik awal
+                if (abs(diff) > .05f && now - lastScrollT > 220) {
+                    GestureService.scroll(diff > 0, sw, sh, (abs(diff) * 3f).coerceIn(.2f, .55f))
+                    lastScrollT = now
                 }
             }
-            lastY = y; paint(Color.rgb(106, 169, 255), false); return
+            paint(Color.rgb(106, 169, 255), false); return
         }
+        wasScroll = false
 
         lastY = -1f; scrollAcc = 0f
         val nx = ((1f - l[8].x() - .15f) / .7f).coerceIn(0f, 1f)
@@ -388,18 +403,34 @@ class HandService : LifecycleService() {
         val pinch = d(l[4], l[8]) / max(d(l[0], l[9]), 1e-6f)
         ps = ps * .5f + pinch * .5f
 
+        val x = fx.f(nx, now) * sw; val y = fy.f(ny, now) * sh
         if (!pinched) {
-            val x = fx.f(nx, now) * sw; val y = fy.f(ny, now) * sh
             tx = x; ty = y
             if (dispX == 0f && dispY == 0f) { dispX = x; dispY = y }
             hist.addLast(Triple(now, x, y))
             while (hist.isNotEmpty() && now - hist.first().first > 400) hist.removeFirst()
         }
-        if (!pinched && ps < .22f) {
-            pinched = true
+        if (!pinched && idx && ps < .22f) {
+            // mulai cubit: titik awal diambil sedikit ke belakang agar tidak meleset
+            pinched = true; dragged = false
             val h = hist.firstOrNull { now - it.first <= 130 } ?: hist.lastOrNull()
-            if (h != null) { tx = h.second; ty = h.third; GestureService.tap(h.second, h.third) }
-        } else if (pinched && ps > .38f) pinched = false
+            ox = h?.second ?: x; oy = h?.third ?: y
+            tx = ox; ty = oy; dragX = ox; dragY = oy; lastDragT = now
+        } else if (pinched) {
+            if (ps > .38f) {                       // lepas cubit
+                if (!dragged) GestureService.tap(ox, oy)   // tanpa geser = klik
+                pinched = false
+            } else {
+                if (!dragged && hypot(x - ox, y - oy) > 70f) { dragged = true; dragX = ox; dragY = oy }
+                if (dragged) {                     // cubit + geser = seret/gulir
+                    tx = x; ty = y
+                    if (now - lastDragT > 120 && hypot(x - dragX, y - dragY) > 25f) {
+                        GestureService.swipe(dragX, dragY, x, y, 100)
+                        dragX = x; dragY = y; lastDragT = now
+                    }
+                }
+            }
+        }
         paint(if (pinched) Color.rgb(79, 195, 161) else Color.YELLOW, pinched)
     }
 }
