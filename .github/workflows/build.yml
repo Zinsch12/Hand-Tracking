@@ -5,9 +5,13 @@ on:
   workflow_dispatch:
 permissions:
   contents: write
+concurrency:
+  group: build
+  cancel-in-progress: true
 jobs:
   build:
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-java@v5
@@ -19,8 +23,11 @@ jobs:
           gradle-version: 8.7
       - run: bash bundle.sh
       - run: gradle assembleDebug --no-daemon
+      - name: Validasi APK
+        run: test -s app/build/outputs/apk/debug/app-debug.apk
       - run: >
-          gh release create v${{ github.run_number }}
+          gh release create
+          v${{ github.run_number }}-${{ github.run_attempt }}
           app/build/outputs/apk/debug/app-debug.apk
           --title "HandCursor v${{ github.run_number }}"
           --notes "Build otomatis"
