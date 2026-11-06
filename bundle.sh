@@ -142,6 +142,7 @@ class GestureService : AccessibilityService() {
 
     override fun onServiceConnected() { inst = this }
     override fun onUnbind(intent: Intent?): Boolean { inst = null; return super.onUnbind(intent) }
+    override fun onDestroy() { inst = null; super.onDestroy() }
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {}
     override fun onInterrupt() {}
 }
@@ -226,6 +227,8 @@ class HandService : LifecycleService() {
     @Volatile private var landmarker: HandLandmarker? = null
     @Volatile private var analysis: ImageAnalysis? = null
     private var usingGpu = true
+    @Volatile private var stopping = false
+    private var provider: ProcessCameraProvider? = null
     @Volatile private var debug = false
     private var dbgView: android.widget.TextView? = null
     private var lastDbg = 0L
@@ -392,7 +395,8 @@ class HandService : LifecycleService() {
         val future = ProcessCameraProvider.getInstance(this)
         future.addListener({
             try {
-                val provider = future.get()
+                val pv = future.get()
+                provider = pv
                 val a = ImageAnalysis.Builder()
                     .setTargetResolution(Size(480, 640))
                     .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
@@ -401,8 +405,8 @@ class HandService : LifecycleService() {
                 a.setAnalyzer(exec) { analyze(it) }
                 analysis = a
                 refreshMetrics()
-                provider.unbindAll()
-                provider.bindToLifecycle(this@HandService, CameraSelector.DEFAULT_FRONT_CAMERA, a)
+                pv.unbindAll()
+                pv.bindToLifecycle(this@HandService, CameraSelector.DEFAULT_FRONT_CAMERA, a)
             } catch (e: Exception) {
                 toast("Kamera gagal dibuka: ${e.message}"); stopSelf()
             }
@@ -416,7 +420,10 @@ class HandService : LifecycleService() {
     }
 
     override fun onDestroy() {
+        stopping = true
         super.onDestroy()
+        try { analysis?.clearAnalyzer() } catch (e: Exception) {}
+        try { provider?.unbindAll() } catch (e: Exception) {}
         prefs.unregisterOnSharedPreferenceChangeListener(prefListener)
         Choreographer.getInstance().removeFrameCallback(frame)
         val lm = landmarker
@@ -431,6 +438,7 @@ class HandService : LifecycleService() {
         var src: Bitmap? = null
         var rotated: Bitmap? = null
         try {
+            if (stopping) return
             val lm = landmarker ?: return
             val now = SystemClock.uptimeMillis()
             if (now <= lastTs) return
@@ -718,6 +726,15 @@ class MainActivity : Activity() {
 EOF
 
 # unduh model tangan MediaPipe (dijalankan di GitHub Actions, yang punya internet)
-curl -fL -o app/src/main/assets/hand_landmarker.task \
-  https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task
+URL=https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task
+OUT=app/src/main/assets/hand_landmarker.task
+ok=0
+for i in 1 2 3 4; do
+  if curl -fL --connect-timeout 20 --max-time 180 -o "$OUT" "$URL"; then
+    if [ "$(stat -c%s "$OUT")" -gt 3000000 ]; then ok=1; break; fi
+    echo "Ukuran model tidak wajar, mengulang..."
+  fi
+  echo "Unduhan gagal (percobaan $i), mengulang..."; sleep 5
+done
+[ "$ok" = 1 ] || { echo "GAGAL: model tangan tidak bisa diunduh"; exit 1; }
 echo "Proyek selesai dibuat."
