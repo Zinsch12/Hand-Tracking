@@ -226,6 +226,10 @@ class HandService : LifecycleService() {
     @Volatile private var landmarker: HandLandmarker? = null
     @Volatile private var analysis: ImageAnalysis? = null
     private var usingGpu = true
+    @Volatile private var debug = false
+    private var dbgView: android.widget.TextView? = null
+    private var lastDbg = 0L
+    private val ext = BooleanArray(4)   // telunjuk, tengah, manis, kelingking (dengan histeresis)
     private var errCount = 0
     private val exec = Executors.newSingleThreadExecutor()
     private val main = Handler(Looper.getMainLooper())
@@ -235,8 +239,8 @@ class HandService : LifecycleService() {
 
     // pengaturan (bisa diubah langsung dari aplikasi)
     @Volatile private var regionK = 1f
-    @Volatile private var pinchClose = .18f
-    @Volatile private var dragThr = 80f
+    @Volatile private var pinchClose = .30f
+    @Volatile private var dragThr = 130f
     @Volatile private var dragGain = 1.1f
     @Volatile private var twoFinger = false
 
@@ -258,6 +262,10 @@ class HandService : LifecycleService() {
     private var dragX = 0f
     private var dragY = 0f
     private var lastDragT = 0L
+    private var pinchStartT = 0L
+    private var lastTapT = 0L
+    private var stickyUntil = 0L
+    private var tappedAtStart = false
 
     private var wasScroll = false
     private var scrollArmAt = 0L
@@ -294,8 +302,10 @@ class HandService : LifecycleService() {
         regionK = 1.4f - .8f * v("spd")                                   // jangkauan kursor
         val sm = 2.0.pow((50 - prefs.getInt("smooth", 50)) / 25.0).toFloat() * .8f
         fx.set(sm, 10f); fy.set(sm, 10f)                                  // kehalusan
-        pinchClose = .10f + .16f * v("pinch")                             // sensitivitas cubit
-        dragThr = 130f - 100f * v("drag")                                 // jarak mulai seret
+        pinchClose = .18f + .24f * v("pinch")                             // sensitivitas cubit
+        debug = prefs.getBoolean("dbg", false)
+        main.post { dbgView?.visibility = if (debug) View.VISIBLE else View.GONE }
+        dragThr = 180f - 100f * v("drag")                                 // jarak mulai seret
         dragGain = .5f + 1.2f * v("gain")                                 // kecepatan seret
         twoFinger = prefs.getBoolean("two", false)
     }
@@ -317,7 +327,7 @@ class HandService : LifecycleService() {
         HandLandmarker.HandLandmarkerOptions.builder()
             .setBaseOptions(BaseOptions.builder().setModelAssetPath("hand_landmarker.task").setDelegate(delegate).build())
             .setNumHands(1)
-            .setMinHandDetectionConfidence(.5f).setMinHandPresenceConfidence(.5f).setMinTrackingConfidence(.5f)
+            .setMinHandDetectionConfidence(.6f).setMinHandPresenceConfidence(.6f).setMinTrackingConfidence(.5f)
             .setRunningMode(RunningMode.VIDEO).build())
 
     override fun onCreate() {
@@ -359,6 +369,17 @@ class HandService : LifecycleService() {
         try { wm.addView(cursor, lp) } catch (e: Exception) {
             toast("Gagal menampilkan kursor. Periksa izin 'tampil di atas aplikasi lain'."); stopSelf(); return
         }
+
+        dbgView = android.widget.TextView(this).apply {
+            textSize = 12f; setTextColor(Color.WHITE); setBackgroundColor(Color.argb(170, 0, 0, 0))
+            setPadding(16, 8, 16, 8); text = "debug"; visibility = if (debug) View.VISIBLE else View.GONE
+        }
+        val dlp = WindowManager.LayoutParams(WindowManager.LayoutParams.WRAP_CONTENT, WindowManager.LayoutParams.WRAP_CONTENT,
+            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+                or WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN, PixelFormat.TRANSLUCENT
+        ).apply { gravity = Gravity.TOP or Gravity.START; x = 8; y = 120 }
+        try { wm.addView(dbgView, dlp) } catch (e: Exception) {}
 
         landmarker = try { build(Delegate.GPU) } catch (e: Exception) {
             usingGpu = false
@@ -403,6 +424,7 @@ class HandService : LifecycleService() {
         exec.execute { try { lm?.close() } catch (e: Exception) {} }   // tutup setelah analisis terakhir selesai
         exec.shutdown()
         try { wm.removeView(cursor) } catch (e: Exception) {}
+        try { wm.removeView(dbgView) } catch (e: Exception) {}
     }
 
     private fun analyze(p: ImageProxy) {
@@ -457,9 +479,10 @@ class HandService : LifecycleService() {
     private fun resetState() {
         fx.reset(); fy.reset()
         pinched = false; pinchN = 0; releaseN = 0; dragged = false; ps = 1f
-        wasScroll = false; anchorY = -1f
+        wasScroll = false; anchorY = -1f; stickyUntil = 0L
         mode = "gerak"; cand = "gerak"; candN = 0
         hist.clear()
+        ext.fill(false)
         paint(Color.YELLOW, false)
     }
 
@@ -480,22 +503,32 @@ class HandService : LifecycleService() {
         else norm.map { P(it.x() * w, it.y() * h, it.z() * w) }
 
         val size = max(dist(q[0], q[9]), 1e-6f)
-        fun er(t: Int, p: Int) = dist(q[0], q[t]) / max(dist(q[0], q[p]), 1e-6f)
-        val rI = er(8, 6)
-        val idx = rI > 1.08f
-        val mid = er(12, 10) > 1.08f
-        val rng = er(16, 14) > 1.08f
-        val pky = er(20, 18) > 1.08f
+        // Kelurusan jari = jarak pangkal-ujung / panjang tulang jari. ~1.0 lurus, ~0.5 menekuk.
+        // Tidak bergantung arah tangan, dan memakai histeresis supaya tidak berkedip.
+        fun st(a: Int, b: Int, c: Int, d: Int) =
+            dist(q[a], q[d]) / max(dist(q[a], q[b]) + dist(q[b], q[c]) + dist(q[c], q[d]), 1e-6f)
+        val sv = floatArrayOf(st(5, 6, 7, 8), st(9, 10, 11, 12), st(13, 14, 15, 16), st(17, 18, 19, 20))
+        for (i in 0..3) { if (sv[i] > .84f) ext[i] = true else if (sv[i] < .70f) ext[i] = false }
+        val idx = ext[0]; val mid = ext[1]; val rng = ext[2]; val pky = ext[3]
+        val sI = sv[0]
         ps = ps * .4f + (dist(q[4], q[8]) / size) * .6f
-        val openThr = pinchClose * 1.7f
+        val openThr = pinchClose * 1.6f
 
-        // Cubit selalu diprioritaskan: saat mencubit telunjuk menekuk dan mirip kepalan.
-        val near = ps < openThr || pinched
+        // Kursor hanya bergerak kalau TELUNJUK terangkat (atau sedang mencubit).
+        // Pose lain (kepalan, hanya jari tengah/manis/kelingking terangkat) = jeda.
+        val near = ps < pinchClose * 1.3f || pinched
         val rawMode = when {
             near -> "gerak"
-            !idx && !rng && !pky -> "jeda"
             twoFinger && idx && mid && !rng && !pky -> "gulir"
-            else -> "gerak"
+            idx -> "gerak"
+            else -> "jeda"
+        }
+        if (debug && now - lastDbg > 150) {
+            lastDbg = now
+            fun f(i: Int, n: String) = n + (if (ext[i]) "+" else "-") + "%.2f".format(sv[i])
+            val t = f(0, "T") + "  " + f(1, "J") + "  " + f(2, "M") + "  " + f(3, "K") +
+                "\ncubit %.2f (batas %.2f)  mode %s".format(ps, pinchClose, mode)
+            main.post { dbgView?.text = t }
         }
         val m = vote(rawMode)
 
@@ -522,31 +555,48 @@ class HandService : LifecycleService() {
 
         // posisi kursor: titik tengah jangkauan, ukuran sesuai pengaturan
         val k = regionK
-        val nx = (((1f - norm[8].x()) - .5f) / (.7f * k) + .5f).coerceIn(0f, 1f)
-        val ny = ((norm[8].y() - .46f) / (.68f * k) + .5f).coerceIn(0f, 1f)
+        // titik kursor: dari sendi PIP ke ujung jari. Makin dekat cubit, makin berat ke PIP
+        // (sendi ini hampir tidak bergerak saat mencubit, jadi kursor tidak ikut bergeser)
+        val wgt = .4f + .6f * ((ps - pinchClose) / (pinchClose * 1.5f)).coerceIn(0f, 1f)
+        val px = norm[6].x() + (norm[8].x() - norm[6].x()) * wgt
+        val py = norm[6].y() + (norm[8].y() - norm[6].y()) * wgt
+        val nx = (((1f - px) - .5f) / (.7f * k) + .5f).coerceIn(0f, 1f)
+        val ny = ((py - .46f) / (.68f * k) + .5f).coerceIn(0f, 1f)
         val x = fx.f(nx, now) * sw
         val y = fy.f(ny, now) * sh
 
         if (!pinched) {
-            tx = x; ty = y
+            // setelah klik, kursor ditahan sebentar di titik klik supaya klik ganda tepat sasaran
+            if (now < stickyUntil && hypot(x - ox, y - oy) < 60f) { tx = ox; ty = oy }
+            else { stickyUntil = 0L; tx = x; ty = y }
             hist.addLast(Triple(now, x, y))
             while (hist.isNotEmpty() && now - hist.first().first > 400) hist.removeFirst()
 
             // mulai cubit: harus terdeteksi 2 frame berturut-turut dan telunjuk tidak terlipat penuh
-            if (ps < pinchClose && rI > .85f) pinchN++ else pinchN = 0
+            if (ps < pinchClose && sI > .55f) pinchN++ else pinchN = 0
             if (pinchN >= 2) {
-                pinched = true; pinchN = 0; releaseN = 0; dragged = false
-                val hh = hist.firstOrNull { now - it.first <= 200 } ?: hist.lastOrNull()
-                ox = hh?.second ?: x; oy = hh?.third ?: y
+                val keep = now < stickyUntil
+                pinched = true; pinchN = 0; releaseN = 0; dragged = false; pinchStartT = now
+                if (!keep) {
+                    val hh = hist.firstOrNull { now - it.first <= 200 } ?: hist.lastOrNull()
+                    ox = hh?.second ?: x; oy = hh?.third ?: y
+                }
                 tx = ox; ty = oy; dragX = ox; dragY = oy; lastDragT = now
+                tappedAtStart = false
+                if (keep && now - lastTapT < 450) {      // cubit kedua cepat = ketukan kedua langsung
+                    GestureService.tap(ox, oy); tappedAtStart = true; lastTapT = now
+                }
             }
         } else {
             if (ps > openThr) releaseN++ else releaseN = 0
             if (releaseN >= 2) {                         // lepas cubit
-                if (!dragged) GestureService.tap(ox, oy) // tanpa geser = klik
+                if (!dragged && !tappedAtStart) { GestureService.tap(ox, oy); lastTapT = now }
+                stickyUntil = if (dragged) 0L else now + 450
                 pinched = false; releaseN = 0; dragged = false
             } else {
-                if (!dragged && hypot(x - ox, y - oy) > dragThr) { dragged = true; dragX = ox; dragY = oy }
+                // cubit singkat butuh geseran jauh lebih besar untuk dianggap seret
+                val thr = if (now - pinchStartT < 250) dragThr * 2.5f else dragThr
+                if (!dragged && hypot(x - ox, y - oy) > thr) { dragged = true; dragX = ox; dragY = oy }
                 if (dragged) {                           // cubit + geser = seret / gulir
                     tx = x; ty = y
                     if (now - lastDragT > 120) {
@@ -636,7 +686,7 @@ class MainActivity : Activity() {
         box.addView(text("Sensitivitas (berlaku langsung)", 20f))
         slider("Jangkauan kursor", "spd", "Naikkan agar gerakan tangan kecil sudah menjangkau seluruh layar.")
         slider("Kehalusan kursor", "smooth", "Naikkan kalau kursor goyang saat diam. Turunkan kalau terasa lambat.")
-        slider("Sensitivitas cubit", "pinch", "Naikkan kalau cubit sulit terdeteksi. Turunkan kalau kadang terdeteksi padahal tidak mencubit.")
+        slider("Sensitivitas cubit", "pinch", "Naikkan kalau cubit sulit terdeteksi. Turunkan kalau kadang terdeteksi padahal tidak mencubit. Setelah memperbarui aplikasi, tekan Atur ulang sensitivitas.")
         slider("Jarak mulai seret", "drag", "Naikkan agar seret lebih cepat dimulai. Turunkan kalau klik sering berubah jadi seret.")
         slider("Kecepatan seret", "gain", "Naikkan agar gulir lebih jauh per gerakan tangan.")
         val sw = Switch(this).apply {
@@ -645,6 +695,12 @@ class MainActivity : Activity() {
             setOnCheckedChangeListener { _, c -> prefs.edit().putBoolean("two", c).apply() }
         }
         box.addView(sw)
+        val dbgSw = Switch(this).apply {
+            text = "Tampilkan info debug (untuk menyetel)"
+            isChecked = prefs.getBoolean("dbg", false)
+            setOnCheckedChangeListener { _, c -> prefs.edit().putBoolean("dbg", c).apply() }
+        }
+        box.addView(dbgSw)
         box.addView(btn("Atur ulang sensitivitas") { prefs.edit().clear().apply(); recreate() })
         setContentView(ScrollView(this).apply { addView(box) })
     }
