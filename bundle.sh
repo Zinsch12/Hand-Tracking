@@ -129,7 +129,12 @@ class GestureService : AccessibilityService() {
     }
 
     private fun gesture(x1: Float, y1: Float, x2: Float, y2: Float, dur: Long) {
-        val p = Path().apply { moveTo(x1, y1); if (x1 != x2 || y1 != y2) lineTo(x2, y2) }
+        // Android menolak usapan yang keluar dari layar, jadi koordinat dibatasi.
+        val dm = resources.displayMetrics
+        val w = dm.widthPixels.toFloat(); val h = dm.heightPixels.toFloat()
+        fun px(v: Float) = v.coerceIn(2f, w - 2f)
+        fun py(v: Float) = v.coerceIn(2f, h - 2f)
+        val p = Path().apply { moveTo(px(x1), py(y1)); if (x1 != x2 || y1 != y2) lineTo(px(x2), py(y2)) }
         val g = GestureDescription.Builder()
             .addStroke(GestureDescription.StrokeDescription(p, 0, dur)).build()
         dispatchGesture(g, null, null)
@@ -150,7 +155,9 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.Intent
+import android.content.SharedPreferences
 import android.content.pm.ServiceInfo
+import android.content.res.Configuration
 import android.graphics.Bitmap
 import android.graphics.Color
 import android.graphics.Matrix
@@ -166,6 +173,7 @@ import android.view.Choreographer
 import android.view.Gravity
 import android.view.View
 import android.view.WindowManager
+import android.widget.Toast
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.ImageProxy
@@ -173,20 +181,31 @@ import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.LifecycleService
 import com.google.mediapipe.framework.image.BitmapImageBuilder
-import com.google.mediapipe.tasks.components.containers.NormalizedLandmark
 import com.google.mediapipe.tasks.core.BaseOptions
 import com.google.mediapipe.tasks.core.Delegate
 import com.google.mediapipe.tasks.vision.core.RunningMode
 import com.google.mediapipe.tasks.vision.handlandmarker.HandLandmarker
+import com.google.mediapipe.tasks.vision.handlandmarker.HandLandmarkerResult
 import java.util.concurrent.Executors
 import kotlin.math.abs
 import kotlin.math.hypot
 import kotlin.math.max
+import kotlin.math.pow
+import kotlin.math.sqrt
+
+/** Titik 3D. */
+internal class P(val x: Float, val y: Float, val z: Float)
+
+internal fun dist(a: P, b: P): Float {
+    val dx = a.x - b.x; val dy = a.y - b.y; val dz = a.z - b.z
+    return sqrt(dx * dx + dy * dy + dz * dz)
+}
 
 /** Filter One Euro: halus saat diam, responsif saat bergerak cepat. */
-class OneEuro(private val mc: Float, private val beta: Float) {
+class OneEuro(private var mc: Float, private var beta: Float) {
     private var x = 0f; private var r = 0f; private var dx = 0f; private var t = 0L; private var init = false
     private fun a(c: Float, dt: Float): Float { val tau = 1f / (2f * Math.PI.toFloat() * c); return 1f / (1f + tau / dt) }
+    fun set(mc: Float, beta: Float) { this.mc = mc; this.beta = beta }
     fun f(v: Float, now: Long): Float {
         if (!init) { init = true; x = v; r = v; dx = 0f; t = now; return v }
         val dt = max(.001f, (now - t) / 1000f); t = now
@@ -202,34 +221,51 @@ class HandService : LifecycleService() {
     private lateinit var wm: WindowManager
     private lateinit var cursor: View
     private lateinit var lp: WindowManager.LayoutParams
+    private lateinit var prefs: SharedPreferences
+    private val prefListener = SharedPreferences.OnSharedPreferenceChangeListener { _, _ -> applyPrefs() }
     @Volatile private var landmarker: HandLandmarker? = null
+    @Volatile private var analysis: ImageAnalysis? = null
     private var usingGpu = true
+    private var errCount = 0
     private val exec = Executors.newSingleThreadExecutor()
     private val main = Handler(Looper.getMainLooper())
-    private var sw = 1080
-    private var sh = 2400
+
+    @Volatile private var sw = 1080
+    @Volatile private var sh = 2400
+
+    // pengaturan (bisa diubah langsung dari aplikasi)
+    @Volatile private var regionK = 1f
+    @Volatile private var pinchClose = .18f
+    @Volatile private var dragThr = 80f
+    @Volatile private var dragGain = 1.1f
+    @Volatile private var twoFinger = false
+
     private val fx = OneEuro(.8f, 10f)
     private val fy = OneEuro(.8f, 10f)
     @Volatile private var tx = -1f
     @Volatile private var ty = -1f
     private var dispX = 0f
     private var dispY = 0f
+    private var hasDisp = false
+
     private var pinched = false
+    private var pinchN = 0
+    private var releaseN = 0
     private var ps = 1f
-    private var lastY = -1f
-    private var scrollAcc = 0f
-    private var lastScrollT = 0L
-    private var lastTs = 0L
-    private var lostAt = 0L
-    private var wasScroll = false
     private var dragged = false
     private var ox = 0f
     private var oy = 0f
     private var dragX = 0f
     private var dragY = 0f
     private var lastDragT = 0L
+
+    private var wasScroll = false
     private var scrollArmAt = 0L
     private var anchorY = -1f
+    private var lastScrollT = 0L
+
+    private var lastTs = 0L
+    private var lostAt = 0L
     private var mode = "gerak"
     private var cand = "gerak"
     private var candN = 0
@@ -239,6 +275,7 @@ class HandService : LifecycleService() {
     private val frame = object : Choreographer.FrameCallback {
         override fun doFrame(t: Long) {
             if (tx >= 0) {
+                if (!hasDisp) { dispX = tx; dispY = ty; hasDisp = true }
                 dispX += (tx - dispX) * .45f; dispY += (ty - dispY) * .45f
                 val nx = (dispX - 45).toInt(); val ny = (dispY - 45).toInt()
                 if (nx != lp.x || ny != lp.y) {
@@ -250,6 +287,32 @@ class HandService : LifecycleService() {
         }
     }
 
+    private fun toast(s: String) { main.post { Toast.makeText(applicationContext, s, Toast.LENGTH_LONG).show() } }
+
+    private fun applyPrefs() {
+        fun v(k: String) = prefs.getInt(k, 50) / 100f
+        regionK = 1.4f - .8f * v("spd")                                   // jangkauan kursor
+        val sm = 2.0.pow((50 - prefs.getInt("smooth", 50)) / 25.0).toFloat() * .8f
+        fx.set(sm, 10f); fy.set(sm, 10f)                                  // kehalusan
+        pinchClose = .10f + .16f * v("pinch")                             // sensitivitas cubit
+        dragThr = 130f - 100f * v("drag")                                 // jarak mulai seret
+        dragGain = .5f + 1.2f * v("gain")                                 // kecepatan seret
+        twoFinger = prefs.getBoolean("two", false)
+    }
+
+    @Suppress("DEPRECATION")
+    private fun refreshMetrics() {
+        val dm = DisplayMetrics()
+        wm.defaultDisplay.getRealMetrics(dm)
+        sw = dm.widthPixels; sh = dm.heightPixels
+        try { analysis?.targetRotation = wm.defaultDisplay.rotation } catch (e: Exception) {}
+    }
+
+    override fun onConfigurationChanged(newConfig: Configuration) {
+        super.onConfigurationChanged(newConfig)
+        refreshMetrics()
+    }
+
     private fun build(delegate: Delegate) = HandLandmarker.createFromOptions(this,
         HandLandmarker.HandLandmarkerOptions.builder()
             .setBaseOptions(BaseOptions.builder().setModelAssetPath("hand_landmarker.task").setDelegate(delegate).build())
@@ -257,13 +320,13 @@ class HandService : LifecycleService() {
             .setMinHandDetectionConfidence(.5f).setMinHandPresenceConfidence(.5f).setMinTrackingConfidence(.5f)
             .setRunningMode(RunningMode.VIDEO).build())
 
-    @Suppress("DEPRECATION")
     override fun onCreate() {
         super.onCreate()
         wm = getSystemService(WINDOW_SERVICE) as WindowManager
-        val dm = DisplayMetrics()
-        wm.defaultDisplay.getRealMetrics(dm)
-        sw = dm.widthPixels; sh = dm.heightPixels
+        prefs = getSharedPreferences("hc", MODE_PRIVATE)
+        applyPrefs()
+        prefs.registerOnSharedPreferenceChangeListener(prefListener)
+        refreshMetrics()
 
         val nm = getSystemService(NotificationManager::class.java)
         nm.createNotificationChannel(NotificationChannel("hc", "HandCursor", NotificationManager.IMPORTANCE_LOW))
@@ -283,29 +346,45 @@ class HandService : LifecycleService() {
                 shape = GradientDrawable.OVAL; setStroke(8, Color.YELLOW); setColor(Color.TRANSPARENT)
             }
         }
+        // FLAG_LAYOUT_IN_SCREEN: koordinat overlay = koordinat layar (sama dengan koordinat ketukan)
         lp = WindowManager.LayoutParams(90, 90, WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
-                or WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS, PixelFormat.TRANSLUCENT
-        ).apply { gravity = Gravity.TOP or Gravity.START; x = sw / 2; y = sh / 2 }
-        try { wm.addView(cursor, lp) } catch (e: Exception) { stopSelf(); return }
+                or WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+            PixelFormat.TRANSLUCENT
+        ).apply {
+            gravity = Gravity.TOP or Gravity.START; x = sw / 2; y = sh / 2
+            if (Build.VERSION.SDK_INT >= 28)
+                layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+        }
+        try { wm.addView(cursor, lp) } catch (e: Exception) {
+            toast("Gagal menampilkan kursor. Periksa izin 'tampil di atas aplikasi lain'."); stopSelf(); return
+        }
 
         landmarker = try { build(Delegate.GPU) } catch (e: Exception) {
             usingGpu = false
-            try { build(Delegate.CPU) } catch (e2: Exception) { stopSelf(); return }
+            try { build(Delegate.CPU) } catch (e2: Exception) {
+                toast("Gagal memuat model tangan: ${e2.message}"); stopSelf(); return
+            }
         }
         Choreographer.getInstance().postFrameCallback(frame)
 
         val future = ProcessCameraProvider.getInstance(this)
         future.addListener({
-            val provider = future.get()
-            val analysis = ImageAnalysis.Builder()
-                .setTargetResolution(Size(480, 640))
-                .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
-                .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
-                .build()
-            analysis.setAnalyzer(exec) { analyze(it) }
-            provider.unbindAll()
-            provider.bindToLifecycle(this@HandService, CameraSelector.DEFAULT_FRONT_CAMERA, analysis)
+            try {
+                val provider = future.get()
+                val a = ImageAnalysis.Builder()
+                    .setTargetResolution(Size(480, 640))
+                    .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+                    .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
+                    .build()
+                a.setAnalyzer(exec) { analyze(it) }
+                analysis = a
+                refreshMetrics()
+                provider.unbindAll()
+                provider.bindToLifecycle(this@HandService, CameraSelector.DEFAULT_FRONT_CAMERA, a)
+            } catch (e: Exception) {
+                toast("Kamera gagal dibuka: ${e.message}"); stopSelf()
+            }
         }, ContextCompat.getMainExecutor(this))
     }
 
@@ -317,37 +396,45 @@ class HandService : LifecycleService() {
 
     override fun onDestroy() {
         super.onDestroy()
+        prefs.unregisterOnSharedPreferenceChangeListener(prefListener)
         Choreographer.getInstance().removeFrameCallback(frame)
+        val lm = landmarker
+        landmarker = null
+        exec.execute { try { lm?.close() } catch (e: Exception) {} }   // tutup setelah analisis terakhir selesai
         exec.shutdown()
-        landmarker?.close()
         try { wm.removeView(cursor) } catch (e: Exception) {}
     }
 
     private fun analyze(p: ImageProxy) {
+        var src: Bitmap? = null
+        var rotated: Bitmap? = null
         try {
             val lm = landmarker ?: return
             val now = SystemClock.uptimeMillis()
             if (now <= lastTs) return
             lastTs = now
-            var bmp = p.toBitmap()
-            val rot = p.imageInfo.rotationDegrees
-            if (rot != 0) {
-                val m = Matrix(); m.postRotate(rot.toFloat())
-                bmp = Bitmap.createBitmap(bmp, 0, 0, bmp.width, bmp.height, m, true)
+            val s0 = p.toBitmap()
+            src = s0
+            var bmp: Bitmap = s0
+            val deg = p.imageInfo.rotationDegrees
+            if (deg != 0) {
+                val m = Matrix(); m.postRotate(deg.toFloat())
+                val r0 = Bitmap.createBitmap(s0, 0, 0, s0.width, s0.height, m, true)
+                rotated = r0; bmp = r0
             }
             val res = lm.detectForVideo(BitmapImageBuilder(bmp).build(), now)
-            handle(res.landmarks().firstOrNull(), now)
+            errCount = 0
+            handle(res, bmp.width, bmp.height, now)
         } catch (e: Exception) {
-            if (usingGpu) { // GPU bermasalah di perangkat ini, pindah ke CPU
+            // pindah ke CPU hanya kalau error berulang (bukan karena satu frame bermasalah)
+            if (usingGpu && ++errCount >= 5) {
                 usingGpu = false
                 try { val old = landmarker; landmarker = build(Delegate.CPU); old?.close() } catch (e2: Exception) {}
             }
-        } finally { p.close() }
+        } finally {
+            rotated?.recycle(); src?.recycle(); p.close()
+        }
     }
-
-    private fun d(a: NormalizedLandmark, b: NormalizedLandmark): Float =
-        hypot((a.x() - b.x()).toDouble(), (a.y() - b.y()).toDouble()).toFloat()
-    private fun ext(l: List<NormalizedLandmark>, t: Int, p: Int) = d(l[0], l[t]) > d(l[0], l[p]) * 1.08f
 
     private fun paint(color: Int, fill: Boolean) {
         val key = color * 2 + (if (fill) 1 else 0)
@@ -367,27 +454,63 @@ class HandService : LifecycleService() {
         return mode
     }
 
-    private fun handle(l: List<NormalizedLandmark>?, now: Long) {
-        if (l == null || l.size < 21) {
-            lastY = -1f
-            if (lostAt == 0L) lostAt = now
-            if (now - lostAt > 400) { fx.reset(); fy.reset(); pinched = false; hist.clear(); paint(Color.YELLOW, false) }
-            return
-        }
+    private fun resetState() {
+        fx.reset(); fy.reset()
+        pinched = false; pinchN = 0; releaseN = 0; dragged = false; ps = 1f
+        wasScroll = false; anchorY = -1f
+        mode = "gerak"; cand = "gerak"; candN = 0
+        hist.clear()
+        paint(Color.YELLOW, false)
+    }
+
+    private fun onLost(now: Long) {
+        if (lostAt == 0L) lostAt = now
+        if (now - lostAt > 400) resetState()
+    }
+
+    private fun handle(res: HandLandmarkerResult, w: Int, h: Int, now: Long) {
+        val norm = res.landmarks().firstOrNull()
+        if (norm == null || norm.size < 21) { onLost(now); return }
         lostAt = 0L
-        val idx = ext(l, 8, 6); val mid = ext(l, 12, 10); val rng = ext(l, 16, 14); val pky = ext(l, 20, 18)
-        val raw = if (!idx && !rng && !pky) "jeda" else if (idx && mid && !rng && !pky) "gulir" else "gerak"
-        val m = vote(raw)
 
-        if (m == "jeda") { lastY = -1f; wasScroll = false; pinched = false; paint(Color.GRAY, false); return }
+        // Koordinat dunia 3D (meter) tahan terhadap rotasi tangan dan rasio layar;
+        // cadangan: koordinat gambar yang sudah dikoreksi rasio.
+        val world = res.worldLandmarks().firstOrNull()
+        val q: List<P> = if (world != null && world.size >= 21) world.map { P(it.x(), it.y(), it.z()) }
+        else norm.map { P(it.x() * w, it.y() * h, it.z() * w) }
 
-        if (m == "gulir") {
-            pinched = false
-            val y = (l[8].y() + l[12].y()) / 2f
+        val size = max(dist(q[0], q[9]), 1e-6f)
+        fun er(t: Int, p: Int) = dist(q[0], q[t]) / max(dist(q[0], q[p]), 1e-6f)
+        val rI = er(8, 6)
+        val idx = rI > 1.08f
+        val mid = er(12, 10) > 1.08f
+        val rng = er(16, 14) > 1.08f
+        val pky = er(20, 18) > 1.08f
+        ps = ps * .4f + (dist(q[4], q[8]) / size) * .6f
+        val openThr = pinchClose * 1.7f
+
+        // Cubit selalu diprioritaskan: saat mencubit telunjuk menekuk dan mirip kepalan.
+        val near = ps < openThr || pinched
+        val rawMode = when {
+            near -> "gerak"
+            !idx && !rng && !pky -> "jeda"
+            twoFinger && idx && mid && !rng && !pky -> "gulir"
+            else -> "gerak"
+        }
+        val m = vote(rawMode)
+
+        if (m == "jeda") {
+            pinched = false; pinchN = 0; releaseN = 0; dragged = false; wasScroll = false
+            paint(Color.GRAY, false); return
+        }
+
+        if (m == "gulir") {                              // gulir dua jari (opsional)
+            pinched = false; pinchN = 0; releaseN = 0; dragged = false
+            val y = (norm[8].y() + norm[12].y()) / 2f
             if (!wasScroll) { wasScroll = true; scrollArmAt = now + 350; anchorY = -1f }
             if (now >= scrollArmAt) {
                 if (anchorY < 0) anchorY = y
-                val diff = y - anchorY            // tahan tangan di atas/bawah titik awal
+                val diff = y - anchorY
                 if (abs(diff) > .05f && now - lastScrollT > 220) {
                     GestureService.scroll(diff > 0, sw, sh, (abs(diff) * 3f).coerceIn(.2f, .55f))
                     lastScrollT = now
@@ -397,36 +520,42 @@ class HandService : LifecycleService() {
         }
         wasScroll = false
 
-        lastY = -1f; scrollAcc = 0f
-        val nx = ((1f - l[8].x() - .15f) / .7f).coerceIn(0f, 1f)
-        val ny = ((l[8].y() - .12f) / .68f).coerceIn(0f, 1f)
-        val pinch = d(l[4], l[8]) / max(d(l[0], l[9]), 1e-6f)
-        ps = ps * .5f + pinch * .5f
+        // posisi kursor: titik tengah jangkauan, ukuran sesuai pengaturan
+        val k = regionK
+        val nx = (((1f - norm[8].x()) - .5f) / (.7f * k) + .5f).coerceIn(0f, 1f)
+        val ny = ((norm[8].y() - .46f) / (.68f * k) + .5f).coerceIn(0f, 1f)
+        val x = fx.f(nx, now) * sw
+        val y = fy.f(ny, now) * sh
 
-        val x = fx.f(nx, now) * sw; val y = fy.f(ny, now) * sh
         if (!pinched) {
             tx = x; ty = y
-            if (dispX == 0f && dispY == 0f) { dispX = x; dispY = y }
             hist.addLast(Triple(now, x, y))
             while (hist.isNotEmpty() && now - hist.first().first > 400) hist.removeFirst()
-        }
-        if (!pinched && idx && ps < .22f) {
-            // mulai cubit: titik awal diambil sedikit ke belakang agar tidak meleset
-            pinched = true; dragged = false
-            val h = hist.firstOrNull { now - it.first <= 130 } ?: hist.lastOrNull()
-            ox = h?.second ?: x; oy = h?.third ?: y
-            tx = ox; ty = oy; dragX = ox; dragY = oy; lastDragT = now
-        } else if (pinched) {
-            if (ps > .38f) {                       // lepas cubit
-                if (!dragged) GestureService.tap(ox, oy)   // tanpa geser = klik
-                pinched = false
+
+            // mulai cubit: harus terdeteksi 2 frame berturut-turut dan telunjuk tidak terlipat penuh
+            if (ps < pinchClose && rI > .85f) pinchN++ else pinchN = 0
+            if (pinchN >= 2) {
+                pinched = true; pinchN = 0; releaseN = 0; dragged = false
+                val hh = hist.firstOrNull { now - it.first <= 200 } ?: hist.lastOrNull()
+                ox = hh?.second ?: x; oy = hh?.third ?: y
+                tx = ox; ty = oy; dragX = ox; dragY = oy; lastDragT = now
+            }
+        } else {
+            if (ps > openThr) releaseN++ else releaseN = 0
+            if (releaseN >= 2) {                         // lepas cubit
+                if (!dragged) GestureService.tap(ox, oy) // tanpa geser = klik
+                pinched = false; releaseN = 0; dragged = false
             } else {
-                if (!dragged && hypot(x - ox, y - oy) > 70f) { dragged = true; dragX = ox; dragY = oy }
-                if (dragged) {                     // cubit + geser = seret/gulir
+                if (!dragged && hypot(x - ox, y - oy) > dragThr) { dragged = true; dragX = ox; dragY = oy }
+                if (dragged) {                           // cubit + geser = seret / gulir
                     tx = x; ty = y
-                    if (now - lastDragT > 120 && hypot(x - dragX, y - dragY) > 25f) {
-                        GestureService.swipe(dragX, dragY, x, y, 100)
-                        dragX = x; dragY = y; lastDragT = now
+                    if (now - lastDragT > 120) {
+                        val ex = (dragX + (x - dragX) * dragGain).coerceIn(2f, sw - 2f)
+                        val ey = (dragY + (y - dragY) * dragGain).coerceIn(2f, sh - 2f)
+                        if (hypot(ex - dragX, ey - dragY) > 25f) {
+                            GestureService.swipe(dragX, dragY, ex, ey, 100)
+                            dragX = x; dragY = y; lastDragT = now
+                        }
                     }
                 }
             }
@@ -450,6 +579,8 @@ import android.provider.Settings
 import android.widget.Button
 import android.widget.LinearLayout
 import android.widget.ScrollView
+import android.widget.SeekBar
+import android.widget.Switch
 import android.widget.TextView
 import android.widget.Toast
 
@@ -458,11 +589,27 @@ class MainActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        val box = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(48, 96, 48, 48) }
+        val prefs = getSharedPreferences("hc", MODE_PRIVATE)
+        val box = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(48, 96, 48, 96) }
         fun text(s: String, size: Float = 16f) = TextView(this).apply { this.text = s; textSize = size; setPadding(0, 12, 0, 12) }
         fun btn(s: String, f: () -> Unit) = Button(this).apply { text = s; setOnClickListener { f() } }
+        fun slider(title: String, key: String, hint: String) {
+            val label = text("$title: ${prefs.getInt(key, 50)}")
+            val sb = SeekBar(this).apply {
+                max = 100; progress = prefs.getInt(key, 50)
+                setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                    override fun onProgressChanged(s: SeekBar?, p: Int, fromUser: Boolean) {
+                        label.text = "$title: $p"; prefs.edit().putInt(key, p).apply()
+                    }
+                    override fun onStartTrackingTouch(s: SeekBar?) {}
+                    override fun onStopTrackingTouch(s: SeekBar?) {}
+                })
+            }
+            box.addView(label); box.addView(sb); box.addView(text(hint, 12f))
+        }
+
         box.addView(text("HandCursor", 28f))
-        box.addView(text("Gerak: telunjuk. Klik: cubit jempol+telunjuk. Gulir: telunjuk+jari tengah naik/turun. Jeda: kepalkan tangan."))
+        box.addView(text("Gerak: acungkan telunjuk. Klik: cubit jempol+telunjuk lalu lepas. Seret/gulir: cubit, tahan, lalu geser tangan. Jeda: kepalkan tangan."))
         status = text("")
         box.addView(status)
         box.addView(btn("1. Izinkan kamera") {
@@ -485,6 +632,20 @@ class MainActivity : Activity() {
             }
         })
         box.addView(btn("Berhenti") { stopService(Intent(this, HandService::class.java)) })
+
+        box.addView(text("Sensitivitas (berlaku langsung)", 20f))
+        slider("Jangkauan kursor", "spd", "Naikkan agar gerakan tangan kecil sudah menjangkau seluruh layar.")
+        slider("Kehalusan kursor", "smooth", "Naikkan kalau kursor goyang saat diam. Turunkan kalau terasa lambat.")
+        slider("Sensitivitas cubit", "pinch", "Naikkan kalau cubit sulit terdeteksi. Turunkan kalau kadang terdeteksi padahal tidak mencubit.")
+        slider("Jarak mulai seret", "drag", "Naikkan agar seret lebih cepat dimulai. Turunkan kalau klik sering berubah jadi seret.")
+        slider("Kecepatan seret", "gain", "Naikkan agar gulir lebih jauh per gerakan tangan.")
+        val sw = Switch(this).apply {
+            text = "Gulir dua jari (alternatif)"
+            isChecked = prefs.getBoolean("two", false)
+            setOnCheckedChangeListener { _, c -> prefs.edit().putBoolean("two", c).apply() }
+        }
+        box.addView(sw)
+        box.addView(btn("Atur ulang sensitivitas") { prefs.edit().clear().apply(); recreate() })
         setContentView(ScrollView(this).apply { addView(box) })
     }
 
