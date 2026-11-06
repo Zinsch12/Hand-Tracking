@@ -279,8 +279,8 @@ class HandService : LifecycleService() {
     @Volatile private var dragGain = 1.1f
     @Volatile private var twoFinger = false
 
-    private val fx = OneEuro(.6f, 10f)
-    private val fy = OneEuro(.6f, 10f)
+    private val fx = OneEuro(.5f, 18f)
+    private val fy = OneEuro(.5f, 18f)
     @Volatile private var tx = -1f
     @Volatile private var ty = -1f
     private var dispX = 0f
@@ -324,20 +324,40 @@ class HandService : LifecycleService() {
     private val hist = ArrayDeque<Triple<Long, Float, Float>>()
 
     @Volatile private var chasing = false
+    private var velX = 0f
+    private var velY = 0f
+    private var lastFrameNs = 0L
+
+    /** SmoothDamp: gerak halus tanpa overshoot, hasilnya sama di layar 60/90/120 Hz. */
+    private fun smoothDamp(cur: Float, target: Float, axis: Int, dt: Float): Float {
+        val omega = 2f / .055f
+        val x = omega * dt
+        val e = 1f / (1f + x + .48f * x * x + .235f * x * x * x)
+        val v = if (axis == 0) velX else velY
+        val change = cur - target
+        val temp = (v + omega * change) * dt
+        val nv = (v - omega * temp) * e
+        if (axis == 0) velX = nv else velY = nv
+        return target + (change + temp) * e
+    }
+
     private val frame = object : Choreographer.FrameCallback {
         override fun doFrame(t: Long) {
             if (tx >= 0) {
-                if (!hasDisp) { dispX = tx; dispY = ty; hasDisp = true }
-                dispX += (tx - dispX) * .5f; dispY += (ty - dispY) * .5f
+                if (!hasDisp) { dispX = tx; dispY = ty; hasDisp = true; velX = 0f; velY = 0f }
+                val dt = if (lastFrameNs == 0L) 1f / 60f else ((t - lastFrameNs) / 1e9f).coerceIn(.004f, .05f)
+                lastFrameNs = t
+                dispX = smoothDamp(dispX, tx, 0, dt); dispY = smoothDamp(dispY, ty, 1, dt)
                 val nx = (dispX - 55).toInt(); val ny = (dispY - 55).toInt()
                 if (nx != lp.x || ny != lp.y) {
                     lp.x = nx; lp.y = ny
                     try { wm.updateViewLayout(cursor, lp) } catch (e: Exception) {}
                 }
-                if (abs(tx - dispX) > .6f || abs(ty - dispY) > .6f) {
+                if (abs(tx - dispX) > .4f || abs(ty - dispY) > .4f || abs(velX) > 5f || abs(velY) > 5f) {
                     Choreographer.getInstance().postFrameCallback(this); return
                 }
             }
+            lastFrameNs = 0L
             chasing = false
         }
     }
@@ -352,8 +372,8 @@ class HandService : LifecycleService() {
     private fun applyPrefs() {
         fun v(k: String) = prefs.getInt(k, 50) / 100f
         regionK = 1.4f - .8f * v("spd")                                   // jangkauan kursor
-        val sm = 2.0.pow((50 - prefs.getInt("smooth", 50)) / 25.0).toFloat() * .6f
-        fx.set(sm, 10f); fy.set(sm, 10f)                                  // kehalusan
+        val sm = 2.0.pow((50 - prefs.getInt("smooth", 50)) / 25.0).toFloat() * .5f
+        fx.set(sm, 18f); fy.set(sm, 18f)                                  // kehalusan
         pinchClose = .18f + .24f * v("pinch")                             // sensitivitas cubit
         debug = prefs.getBoolean("dbg", false)
         main.post { dbgView?.visibility = if (debug) View.VISIBLE else View.GONE }
@@ -442,7 +462,7 @@ class HandService : LifecycleService() {
                 val pv = future.get()
                 provider = pv
                 val a = ImageAnalysis.Builder()
-                    .setTargetResolution(Size(360, 480))
+                    .setTargetResolution(Size(480, 640))
                     .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
                     .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
                     .build()
@@ -478,10 +498,14 @@ class HandService : LifecycleService() {
         try { wm.removeView(dbgView) } catch (e: Exception) {}
     }
 
+    // bitmap dipakai ulang tiap frame: tidak ada alokasi besar berulang, GC jarang jalan
+    private var srcBuf: Bitmap? = null
+    private var rotBuf: Bitmap? = null
+    private var enhBuf: Bitmap? = null
+    private val rotMatrix = Matrix()
+    private val enhPaint = Paint()
+
     private fun analyze(p: ImageProxy) {
-        var src: Bitmap? = null
-        var rotated: Bitmap? = null
-        var enhanced: Bitmap? = null
         try {
             if (stopping) return
             val lm = landmarker ?: return
@@ -491,24 +515,55 @@ class HandService : LifecycleService() {
             if (lostAt != 0L && now - lostAt > 2000 && now - lastProcT < 100) return
             lastProcT = now
             lastTs = now
-            val s0 = p.toBitmap()
-            src = s0
-            var bmp: Bitmap = s0
+
+            val plane = p.planes[0]
+            val src: Bitmap
+            if (plane.rowStride == p.width * 4) {
+                var sb = srcBuf
+                if (sb == null || sb.width != p.width || sb.height != p.height) {
+                    sb = Bitmap.createBitmap(p.width, p.height, Bitmap.Config.ARGB_8888); srcBuf = sb
+                }
+                plane.buffer.rewind()
+                sb.copyPixelsFromBuffer(plane.buffer)
+                src = sb
+            } else {
+                src = p.toBitmap()                 // cadangan kalau tata letak memori tak lazim
+            }
+
+            var bmp: Bitmap = src
             val deg = p.imageInfo.rotationDegrees
             if (deg != 0) {
-                val m = Matrix(); m.postRotate(deg.toFloat())
-                val r0 = Bitmap.createBitmap(s0, 0, 0, s0.width, s0.height, m, true)
-                rotated = r0; bmp = r0
+                val rw = if (deg == 90 || deg == 270) src.height else src.width
+                val rh = if (deg == 90 || deg == 270) src.width else src.height
+                var dst = rotBuf
+                if (dst == null || dst.width != rw || dst.height != rh) {
+                    dst = Bitmap.createBitmap(rw, rh, Bitmap.Config.ARGB_8888); rotBuf = dst
+                }
+                rotMatrix.reset(); rotMatrix.setRotate(deg.toFloat())
+                when (deg) {
+                    90 -> rotMatrix.postTranslate(src.height.toFloat(), 0f)
+                    180 -> rotMatrix.postTranslate(src.width.toFloat(), src.height.toFloat())
+                    270 -> rotMatrix.postTranslate(0f, src.width.toFloat())
+                }
+                Canvas(dst).drawBitmap(src, rotMatrix, null)
+                bmp = dst
             }
+
             if (++frameN % 8 == 0) lum = luma(bmp)      // cukup dicek tiap 8 frame
-            if (lum < 70f) {                       // ruangan gelap: terangkan gambar sebelum dideteksi
-                val e = enhance(bmp, (100f / max(lum, 15f)).coerceIn(1f, 2.8f))
-                enhanced = e; bmp = e
+            if (lum < 70f) {                            // ruangan gelap: terangkan gambar sebelum dideteksi
+                var eb = enhBuf
+                if (eb == null || eb.width != bmp.width || eb.height != bmp.height) {
+                    eb = Bitmap.createBitmap(bmp.width, bmp.height, Bitmap.Config.ARGB_8888); enhBuf = eb
+                }
+                enhanceInto(bmp, eb, (100f / max(lum, 15f)).coerceIn(1f, 2.8f))
+                bmp = eb
                 if (lum < 40f && now - lastDarkWarn > 20000) {
                     lastDarkWarn = now; toast("Ruangan terlalu gelap, pelacakan bisa kurang akurat. Tambah cahaya.")
                 }
             }
-            val res = lm.detectForVideo(BitmapImageBuilder(bmp).build(), now)
+
+            val mp = BitmapImageBuilder(bmp).build()
+            val res = try { lm.detectForVideo(mp, now) } finally { mp.close() }
             errCount = 0
             handle(res, bmp.width, bmp.height, now)
         } catch (e: Exception) {
@@ -518,7 +573,7 @@ class HandService : LifecycleService() {
                 try { val old = landmarker; landmarker = build(Delegate.CPU); old?.close() } catch (e2: Exception) {}
             }
         } finally {
-            enhanced?.recycle(); rotated?.recycle(); src?.recycle(); p.close()
+            p.close()
         }
     }
 
@@ -558,18 +613,15 @@ class HandService : LifecycleService() {
         return if (n > 0) sum / n else 128f
     }
 
-    private fun enhance(src: Bitmap, gain: Float): Bitmap {
-        val out = Bitmap.createBitmap(src.width, src.height, Bitmap.Config.ARGB_8888)
-        val pt = Paint()
-        pt.colorFilter = ColorMatrixColorFilter(ColorMatrix(floatArrayOf(
+    private fun enhanceInto(src: Bitmap, dst: Bitmap, gain: Float) {
+        enhPaint.colorFilter = ColorMatrixColorFilter(ColorMatrix(floatArrayOf(
             gain, 0f, 0f, 0f, 0f,  0f, gain, 0f, 0f, 0f,  0f, 0f, gain, 0f, 0f,  0f, 0f, 0f, 1f, 0f)))
-        Canvas(out).drawBitmap(src, 0f, 0f, pt)
-        return out
+        Canvas(dst).drawBitmap(src, 0f, 0f, enhPaint)
     }
 
     private fun vote(m: String): String {
         if (m == mode) { candN = 0; return mode }
-        if (m == cand) { if (++candN >= (if (m == "gulir") 6 else 3)) { mode = m; candN = 0 } } else { cand = m; candN = 1 }
+        if (m == cand) { if (++candN >= (when (m) { "jeda" -> 5; "gulir" -> 6; else -> 2 })) { mode = m; candN = 0 } } else { cand = m; candN = 1 }
         return mode
     }
 
@@ -594,7 +646,7 @@ class HandService : LifecycleService() {
         // Saring deteksi meragukan: skor rendah, tangan terlalu kecil (latar jauh) atau terlalu besar
         val hs = res.handednesses().firstOrNull()?.firstOrNull()?.score() ?: 1f
         val hsz = hypot(((norm[0].x() - norm[9].x()) * w).toDouble(), ((norm[0].y() - norm[9].y()) * h).toDouble()).toFloat() / h
-        if (hs < .65f || hsz < .05f || hsz > .55f) { onLost(now); return }
+        if (hs < .4f || hsz < .05f || hsz > .55f) { onLost(now); return }
         // Buang lonjakan mendadak satu frame (deteksi salah ke objek lain)
         val wx = norm[0].x(); val wy = norm[0].y()
         if (prevT != 0L && now - prevT < 150) {
@@ -616,7 +668,11 @@ class HandService : LifecycleService() {
         fun st(a: Int, b: Int, c: Int, d: Int) =
             dist(q[a], q[d]) / max(dist(q[a], q[b]) + dist(q[b], q[c]) + dist(q[c], q[d]), 1e-6f)
         val sv = floatArrayOf(st(5, 6, 7, 8), st(9, 10, 11, 12), st(13, 14, 15, 16), st(17, 18, 19, 20))
-        for (i in 0..3) { if (sv[i] > .84f) ext[i] = true else if (sv[i] < .70f) ext[i] = false }
+        for (i in 0..3) {
+            val on = if (i == 0) .80f else .84f      // telunjuk lebih toleran: tidak mudah dianggap terlipat
+            val off = if (i == 0) .62f else .70f
+            if (sv[i] > on) ext[i] = true else if (sv[i] < off) ext[i] = false
+        }
         val idx = ext[0]; val mid = ext[1]; val rng = ext[2]; val pky = ext[3]
         val sI = sv[0]
         ps = ps * .4f + (dist(q[4], q[8]) / size) * .6f
@@ -678,7 +734,7 @@ class HandService : LifecycleService() {
             if (now < stickyUntil && hypot(x - ox, y - oy) < 60f) { tx = ox; ty = oy }
             else {
                 stickyUntil = 0L
-                if (tx < 0f || hypot(x - tx, y - ty) > 2.5f) { tx = x; ty = y }   // abaikan getaran kecil saat diam
+                if (tx < 0f || hypot(x - tx, y - ty) > 4f) { tx = x; ty = y }   // abaikan getaran kecil saat diam
             }
             hist.addLast(Triple(now, x, y))
             while (hist.isNotEmpty() && now - hist.first().first > 400) hist.removeFirst()
