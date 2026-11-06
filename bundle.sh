@@ -211,44 +211,26 @@ internal fun dist(a: P, b: P): Float {
     return sqrt(dx * dx + dy * dy + dz * dz)
 }
 
-/** Kursor HUD futuristik: cincin berputar, bidik, dan riak saat klik. */
+/** Kursor ringan: satu cincin + titik, digambar ulang hanya saat status berubah. */
 class HudView(c: Context) : View(c) {
-    @Volatile var state = 0      // 0 gerak, 1 cubit, 2 jeda, 3 gulir, 4 seret
-    @Volatile var spin = 0f
-    @Volatile var ripple = 0f
-    private val p = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.STROKE; strokeCap = Paint.Cap.ROUND }
+    var state = 0      // 0 gerak, 1 cubit, 2 jeda, 3 gulir, 4 seret
+        set(v) { if (field != v) { field = v; invalidate() } }
+    private val p = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.STROKE; strokeWidth = 5f }
     private val f = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
-    private val rect = RectF()
     override fun onDraw(cv: Canvas) {
         val cx = width / 2f; val cy = height / 2f; val r = minOf(cx, cy) - 4f
         val col = when (state) {
-            1 -> Color.parseColor("#7CFFCB"); 2 -> Color.parseColor("#8899A6")
+            1 -> Color.parseColor("#4FC3A1"); 2 -> Color.parseColor("#8899A6")
             3 -> Color.parseColor("#6AA9FF"); 4 -> Color.parseColor("#FFB347")
-            else -> Color.parseColor("#00E5FF")
+            else -> Color.parseColor("#FFD166")
         }
         val pinch = state == 1 || state == 4
-        val rr = if (pinch) r * .8f else r
-        p.color = col; p.alpha = 45; p.strokeWidth = 12f
-        cv.drawCircle(cx, cy, rr * .92f, p)                               // cahaya
-        p.color = col; p.alpha = 255; p.strokeWidth = 4f
-        rect.set(cx - rr, cy - rr, cx + rr, cy + rr)
-        for (i in 0..2) cv.drawArc(rect, spin + i * 120f, 70f, false, p)   // busur berputar
-        val ir = rr * (if (pinch) .38f else .55f)
-        p.color = col; p.alpha = 200; p.strokeWidth = 2f
-        cv.drawCircle(cx, cy, ir, p)                                      // cincin dalam
-        p.color = col; p.alpha = 255; p.strokeWidth = 3f
-        for (a in 0..3) {                                                 // tanda bidik
-            val ang = Math.toRadians((a * 90).toDouble())
-            val co = cos(ang).toFloat(); val si = sin(ang).toFloat()
-            cv.drawLine(cx + co * ir * 1.25f, cy + si * ir * 1.25f, cx + co * ir * 1.9f, cy + si * ir * 1.9f, p)
-        }
-        f.color = col; f.alpha = if (pinch) 255 else 220
-        cv.drawCircle(cx, cy, if (pinch) 9f else 5f, f)                  // titik pusat
-        if (pinch) { f.color = col; f.alpha = 70; cv.drawCircle(cx, cy, ir, f) }
-        if (ripple > 0f) {                                                // riak klik
-            p.color = col; p.alpha = ((1f - ripple) * 255).toInt().coerceIn(0, 255); p.strokeWidth = 3f
-            cv.drawCircle(cx, cy, r * (.3f + ripple * .7f), p)
-        }
+        p.color = col
+        cv.drawCircle(cx, cy, if (pinch) r * .7f else r, p)
+        f.color = col
+        if (pinch) { f.alpha = 110; cv.drawCircle(cx, cy, r * .7f, f) }
+        f.color = col; f.alpha = 255
+        cv.drawCircle(cx, cy, if (pinch) 6f else 4f, f)
     }
 }
 
@@ -297,8 +279,8 @@ class HandService : LifecycleService() {
     @Volatile private var dragGain = 1.1f
     @Volatile private var twoFinger = false
 
-    private val fx = OneEuro(.8f, 10f)
-    private val fy = OneEuro(.8f, 10f)
+    private val fx = OneEuro(.6f, 10f)
+    private val fy = OneEuro(.6f, 10f)
     @Volatile private var tx = -1f
     @Volatile private var ty = -1f
     private var dispX = 0f
@@ -326,6 +308,7 @@ class HandService : LifecycleService() {
     private var lastScrollT = 0L
 
     private var lastTs = 0L
+    private var frameN = 0
     private var lastProcT = 0L
     private var lastDarkWarn = 0L
     @Volatile private var lum = 128f
@@ -340,22 +323,28 @@ class HandService : LifecycleService() {
     private var paintKey = -1
     private val hist = ArrayDeque<Triple<Long, Float, Float>>()
 
+    @Volatile private var chasing = false
     private val frame = object : Choreographer.FrameCallback {
         override fun doFrame(t: Long) {
-            cursor.spin = (cursor.spin + (if (cursor.state == 2) .6f else 2.2f)) % 360f
-            if (cursor.ripple > 0f) { cursor.ripple += .07f; if (cursor.ripple >= 1f) cursor.ripple = 0f }
-            cursor.invalidate()
             if (tx >= 0) {
                 if (!hasDisp) { dispX = tx; dispY = ty; hasDisp = true }
-                dispX += (tx - dispX) * .45f; dispY += (ty - dispY) * .45f
-                val nx = (dispX - 75).toInt(); val ny = (dispY - 75).toInt()
+                dispX += (tx - dispX) * .5f; dispY += (ty - dispY) * .5f
+                val nx = (dispX - 55).toInt(); val ny = (dispY - 55).toInt()
                 if (nx != lp.x || ny != lp.y) {
                     lp.x = nx; lp.y = ny
                     try { wm.updateViewLayout(cursor, lp) } catch (e: Exception) {}
                 }
+                if (abs(tx - dispX) > .6f || abs(ty - dispY) > .6f) {
+                    Choreographer.getInstance().postFrameCallback(this); return
+                }
             }
-            Choreographer.getInstance().postFrameCallback(this)
+            chasing = false
         }
+    }
+
+    /** Jalankan pengejaran posisi hanya kalau target berubah; berhenti sendiri saat sudah sampai. */
+    private fun kick() {
+        if (!chasing) { chasing = true; main.post { Choreographer.getInstance().postFrameCallback(frame) } }
     }
 
     private fun toast(s: String) { main.post { Toast.makeText(applicationContext, s, Toast.LENGTH_LONG).show() } }
@@ -363,7 +352,7 @@ class HandService : LifecycleService() {
     private fun applyPrefs() {
         fun v(k: String) = prefs.getInt(k, 50) / 100f
         regionK = 1.4f - .8f * v("spd")                                   // jangkauan kursor
-        val sm = 2.0.pow((50 - prefs.getInt("smooth", 50)) / 25.0).toFloat() * .8f
+        val sm = 2.0.pow((50 - prefs.getInt("smooth", 50)) / 25.0).toFloat() * .6f
         fx.set(sm, 10f); fy.set(sm, 10f)                                  // kehalusan
         pinchClose = .18f + .24f * v("pinch")                             // sensitivitas cubit
         debug = prefs.getBoolean("dbg", false)
@@ -416,7 +405,7 @@ class HandService : LifecycleService() {
 
         cursor = HudView(this)
         // FLAG_LAYOUT_IN_SCREEN: koordinat overlay = koordinat layar (sama dengan koordinat ketukan)
-        lp = WindowManager.LayoutParams(150, 150, WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+        lp = WindowManager.LayoutParams(110, 110, WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
                 or WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
             PixelFormat.TRANSLUCENT
@@ -446,7 +435,6 @@ class HandService : LifecycleService() {
                 toast("Gagal memuat model tangan: ${e2.message}"); stopSelf(); return
             }
         }
-        Choreographer.getInstance().postFrameCallback(frame)
 
         val future = ProcessCameraProvider.getInstance(this)
         future.addListener({
@@ -454,7 +442,7 @@ class HandService : LifecycleService() {
                 val pv = future.get()
                 provider = pv
                 val a = ImageAnalysis.Builder()
-                    .setTargetResolution(Size(480, 640))
+                    .setTargetResolution(Size(360, 480))
                     .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
                     .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
                     .build()
@@ -512,7 +500,7 @@ class HandService : LifecycleService() {
                 val r0 = Bitmap.createBitmap(s0, 0, 0, s0.width, s0.height, m, true)
                 rotated = r0; bmp = r0
             }
-            lum = luma(bmp)
+            if (++frameN % 8 == 0) lum = luma(bmp)      // cukup dicek tiap 8 frame
             if (lum < 70f) {                       // ruangan gelap: terangkan gambar sebelum dideteksi
                 val e = enhance(bmp, (100f / max(lum, 15f)).coerceIn(1f, 2.8f))
                 enhanced = e; bmp = e
@@ -542,7 +530,6 @@ class HandService : LifecycleService() {
 
     private fun doTap(x: Float, y: Float) {
         GestureService.tap(x, y)
-        main.post { cursor.ripple = .001f }
     }
 
     /** Di 6% tepi layar, 3% terluar dipetakan tepat ke tepi supaya tombol di pinggir mudah dicapai. */
@@ -678,18 +665,21 @@ class HandService : LifecycleService() {
         val k = regionK
         // titik kursor: dari sendi PIP ke ujung jari. Makin dekat cubit, makin berat ke PIP
         // (sendi ini hampir tidak bergerak saat mencubit, jadi kursor tidak ikut bergeser)
-        val wgt = .4f + .6f * ((ps - pinchClose) / (pinchClose * 1.5f)).coerceIn(0f, 1f)
+        val wgt = .65f
         val px = norm[6].x() + (norm[8].x() - norm[6].x()) * wgt
         val py = norm[6].y() + (norm[8].y() - norm[6].y()) * wgt
         val nx = (((1f - px) - .5f) / (.7f * k) + .5f).coerceIn(0f, 1f)
         val ny = ((py - .46f) / (.68f * k) + .5f).coerceIn(0f, 1f)
-        val x = snap(((fx.f(nx, now) - .5f) * 1.15f + .5f).coerceIn(0f, 1f) * sw, sw.toFloat())
-        val y = snap(((fy.f(ny, now) - .5f) * 1.15f + .5f).coerceIn(0f, 1f) * sh, sh.toFloat())
+        val x = snap(((fx.f(nx, now) - .5f) * 1.10f + .5f).coerceIn(0f, 1f) * sw, sw.toFloat())
+        val y = snap(((fy.f(ny, now) - .5f) * 1.10f + .5f).coerceIn(0f, 1f) * sh, sh.toFloat())
 
         if (!pinched) {
             // setelah klik, kursor ditahan sebentar di titik klik supaya klik ganda tepat sasaran
             if (now < stickyUntil && hypot(x - ox, y - oy) < 60f) { tx = ox; ty = oy }
-            else { stickyUntil = 0L; tx = x; ty = y }
+            else {
+                stickyUntil = 0L
+                if (tx < 0f || hypot(x - tx, y - ty) > 2.5f) { tx = x; ty = y }   // abaikan getaran kecil saat diam
+            }
             hist.addLast(Triple(now, x, y))
             while (hist.isNotEmpty() && now - hist.first().first > 400) hist.removeFirst()
 
@@ -731,6 +721,7 @@ class HandService : LifecycleService() {
                 }
             }
         }
+        kick()
         paint(if (dragged) 4 else if (pinched) 1 else 0)
     }
 }
@@ -743,10 +734,6 @@ import android.Manifest
 import android.app.Activity
 import android.content.Intent
 import android.content.pm.PackageManager
-import android.content.res.ColorStateList
-import android.graphics.Color
-import android.graphics.Typeface
-import android.graphics.drawable.GradientDrawable
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -761,32 +748,17 @@ import android.widget.Toast
 
 class MainActivity : Activity() {
     private lateinit var status: TextView
-    private val cy = Color.parseColor("#00E5FF")
-    private val ink = Color.parseColor("#B8F3FF")
-    private val dim = Color.parseColor("#5E8A99")
-    private val bg = Color.parseColor("#050A10")
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        window.statusBarColor = bg
-        window.navigationBarColor = bg
         val prefs = getSharedPreferences("hc", MODE_PRIVATE)
-        val mono = Typeface.MONOSPACE
-        val box = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(40, 96, 40, 96); setBackgroundColor(bg) }
-        fun text(s: String, size: Float = 14f, color: Int = ink) = TextView(this).apply {
-            this.text = s; textSize = size; typeface = mono; setTextColor(color); setPadding(0, 10, 0, 10)
-        }
-        fun btn(s: String, f: () -> Unit) = Button(this).apply {
-            text = s; typeface = mono; setTextColor(cy); isAllCaps = false
-            background = GradientDrawable().apply { setColor(Color.parseColor("#0A1822")); setStroke(2, cy); cornerRadius = 10f }
-            layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply { topMargin = 14 }
-            setOnClickListener { f() }
-        }
+        val box = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(48, 96, 48, 96) }
+        fun text(s: String, size: Float = 16f) = TextView(this).apply { this.text = s; textSize = size; setPadding(0, 12, 0, 12) }
+        fun btn(s: String, f: () -> Unit) = Button(this).apply { text = s; setOnClickListener { f() } }
         fun slider(title: String, key: String, hint: String) {
-            val label = text("$title: ${prefs.getInt(key, 50)}", 14f, cy)
+            val label = text("$title: ${prefs.getInt(key, 50)}")
             val sb = SeekBar(this).apply {
                 max = 100; progress = prefs.getInt(key, 50)
-                progressTintList = ColorStateList.valueOf(cy); thumbTintList = ColorStateList.valueOf(cy)
                 setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
                     override fun onProgressChanged(s: SeekBar?, p: Int, fromUser: Boolean) {
                         label.text = "$title: $p"; prefs.edit().putInt(key, p).apply()
@@ -795,31 +767,30 @@ class MainActivity : Activity() {
                     override fun onStopTrackingTouch(s: SeekBar?) {}
                 })
             }
-            box.addView(label); box.addView(sb); box.addView(text(hint, 11f, dim))
+            box.addView(label); box.addView(sb); box.addView(text(hint, 12f))
         }
         fun toggle(title: String, key: String) = Switch(this).apply {
-            text = title; typeface = mono; setTextColor(ink)
+            text = title
             isChecked = prefs.getBoolean(key, false)
             setOnCheckedChangeListener { _, c -> prefs.edit().putBoolean(key, c).apply() }
         }
 
-        box.addView(text("◢ HAND//CURSOR ◣", 26f, cy))
-        box.addView(text("SISTEM KENDALI KURSOR BERBASIS TANGAN", 11f, dim))
-        box.addView(text("GERAK  : acungkan telunjuk\nKLIK   : cubit jempol+telunjuk, lepas\nSERET  : cubit, tahan, geser tangan\nJEDA   : kepalkan tangan", 12f))
-        status = text("", 13f)
+        box.addView(text("HandCursor", 28f))
+        box.addView(text("Gerak: acungkan telunjuk. Klik: cubit jempol+telunjuk lalu lepas. Seret/gulir: cubit, tahan, geser tangan. Jeda: kepalkan tangan."))
+        status = text("")
         box.addView(status)
-        box.addView(btn("[1] IZINKAN KAMERA") {
+        box.addView(btn("1. Izinkan kamera") {
             val p = mutableListOf(Manifest.permission.CAMERA)
             if (Build.VERSION.SDK_INT >= 33) p.add(Manifest.permission.POST_NOTIFICATIONS)
             requestPermissions(p.toTypedArray(), 1)
         })
-        box.addView(btn("[2] IZINKAN TAMPIL DI ATAS APLIKASI LAIN") {
+        box.addView(btn("2. Izinkan tampil di atas aplikasi lain") {
             startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName")))
         })
-        box.addView(btn("[3] AKTIFKAN LAYANAN AKSESIBILITAS") {
+        box.addView(btn("3. Aktifkan layanan aksesibilitas") {
             startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
         })
-        box.addView(btn("[4] ▶ MULAI") {
+        box.addView(btn("4. MULAI") {
             when {
                 checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED -> toast("Izin kamera belum diberikan")
                 !Settings.canDrawOverlays(this) -> toast("Izin tampil di atas aplikasi lain belum diberikan")
@@ -827,9 +798,9 @@ class MainActivity : Activity() {
                 else -> { startForegroundService(Intent(this, HandService::class.java)); toast("HandCursor berjalan. Buka aplikasi lain.") }
             }
         })
-        box.addView(btn("■ BERHENTI") { stopService(Intent(this, HandService::class.java)) })
+        box.addView(btn("Berhenti") { stopService(Intent(this, HandService::class.java)) })
 
-        box.addView(text("// KALIBRASI SENSITIVITAS", 16f, cy))
+        box.addView(text("Sensitivitas (berlaku langsung)", 20f))
         slider("Jangkauan kursor", "spd", "Naikkan agar gerakan tangan kecil menjangkau seluruh layar, termasuk tepi.")
         slider("Kehalusan kursor", "smooth", "Naikkan kalau kursor goyang saat diam. Turunkan kalau terasa lambat.")
         slider("Sensitivitas cubit", "pinch", "Naikkan kalau cubit sulit terdeteksi. Turunkan kalau terdeteksi padahal tidak mencubit.")
@@ -837,16 +808,16 @@ class MainActivity : Activity() {
         slider("Kecepatan seret", "gain", "Naikkan agar gulir lebih jauh per gerakan tangan.")
         box.addView(toggle("Gulir dua jari (alternatif)", "two"))
         box.addView(toggle("Info debug (untuk menyetel)", "dbg"))
-        box.addView(btn("ATUR ULANG SENSITIVITAS") { prefs.edit().clear().apply(); recreate() })
-        setContentView(ScrollView(this).apply { setBackgroundColor(bg); addView(box) })
+        box.addView(btn("Atur ulang sensitivitas") { prefs.edit().clear().apply(); recreate() })
+        setContentView(ScrollView(this).apply { addView(box) })
     }
 
     override fun onResume() {
         super.onResume()
-        fun ok(b: Boolean) = if (b) "● ONLINE" else "○ BELUM"
-        status.text = "KAMERA        ▸ ${ok(checkSelfPermission(Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED)}\n" +
-            "OVERLAY       ▸ ${ok(Settings.canDrawOverlays(this))}\n" +
-            "AKSESIBILITAS ▸ ${ok(GestureService.inst != null)}"
+        fun ok(b: Boolean) = if (b) "OK" else "belum"
+        status.text = "Kamera: ${ok(checkSelfPermission(Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED)}\n" +
+            "Tampil di atas aplikasi: ${ok(Settings.canDrawOverlays(this))}\n" +
+            "Aksesibilitas: ${ok(GestureService.inst != null)}"
     }
 
     private fun toast(s: String) = Toast.makeText(this, s, Toast.LENGTH_LONG).show()
