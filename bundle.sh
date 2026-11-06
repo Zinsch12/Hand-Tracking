@@ -221,12 +221,12 @@ class HudView(c: Context) : View(c) {
         val cx = width / 2f; val cy = height / 2f; val r = minOf(cx, cy) - 4f
         val col = when (state) {
             1 -> Color.parseColor("#4FC3A1"); 2 -> Color.parseColor("#8899A6")
-            3 -> Color.parseColor("#6AA9FF"); 4 -> Color.parseColor("#FFB347")
+            3 -> Color.parseColor("#6AA9FF"); 4 -> Color.parseColor("#FFB347"); 5 -> Color.WHITE
             else -> Color.parseColor("#FFD166")
         }
         val pinch = state == 1 || state == 4
         p.color = col
-        cv.drawCircle(cx, cy, if (pinch) r * .7f else r, p)
+        cv.drawCircle(cx, cy, if (pinch) r * .7f else if (state == 5) r * .85f else r, p)
         f.color = col
         if (pinch) { f.alpha = 110; cv.drawCircle(cx, cy, r * .7f, f) }
         f.color = col; f.alpha = 255
@@ -278,6 +278,7 @@ class HandService : LifecycleService() {
     @Volatile private var dragThr = 130f
     @Volatile private var dragGain = 1.1f
     @Volatile private var twoFinger = false
+    @Volatile private var relative = true
 
     private val fx = OneEuro(.6f, 10f)
     private val fy = OneEuro(.6f, 10f)
@@ -297,6 +298,12 @@ class HandService : LifecycleService() {
     private var dragX = 0f
     private var dragY = 0f
     private var lastDragT = 0L
+    private var curX = 0f
+    private var curY = 0f
+    private var relX = 0f
+    private var relY = 0f
+    private var relT = 0L
+    private var relValid = false
     private var pinchStartT = 0L
     private var lastTapT = 0L
     private var stickyUntil = 0L
@@ -360,6 +367,7 @@ class HandService : LifecycleService() {
         dragThr = 180f - 100f * v("drag")                                 // jarak mulai seret
         dragGain = .5f + 1.2f * v("gain")                                 // kecepatan seret
         twoFinger = prefs.getBoolean("two", false)
+        relative = prefs.getBoolean("rel", true)
     }
 
     @Suppress("DEPRECATION")
@@ -576,7 +584,7 @@ class HandService : LifecycleService() {
     private fun resetState() {
         fx.reset(); fy.reset()
         pinched = false; pinchN = 0; releaseN = 0; dragged = false; ps = 1f
-        wasScroll = false; anchorY = -1f; stickyUntil = 0L
+        wasScroll = false; anchorY = -1f; stickyUntil = 0L; relValid = false
         mode = "gerak"; cand = "gerak"; candN = 0
         hist.clear()
         ext.fill(false)
@@ -584,6 +592,7 @@ class HandService : LifecycleService() {
     }
 
     private fun onLost(now: Long) {
+        relValid = false
         if (lostAt == 0L) lostAt = now
         if (now - lostAt > 400) resetState()
     }
@@ -602,6 +611,14 @@ class HandService : LifecycleService() {
             if (jump > .30f && jumpN < 2) { jumpN++; return }
         }
         jumpN = 0; prevWx = wx; prevWy = wy; prevT = now
+        // Tangan menyentuh/keluar tepi frame: sebagian landmark hasil tebakan model, jadi jangan dipakai
+        var mnX = 1f; var mxX = 0f; var mnY = 1f; var mxY = 0f
+        for (pt in norm) {
+            val a = pt.x(); val b = pt.y()
+            if (a < mnX) mnX = a; if (a > mxX) mxX = a; if (b < mnY) mnY = b; if (b > mxY) mxY = b
+        }
+        val em = if (relative) .01f else -.03f
+        if (mnX < em || mxX > 1f - em || mnY < em || mxY > 1f - em) { paint(2); onLost(now); return }
         lostAt = 0L
 
         // Koordinat dunia 3D (meter) tahan terhadap rotasi tangan dan rasio layar;
@@ -641,12 +658,12 @@ class HandService : LifecycleService() {
         val m = vote(rawMode)
 
         if (m == "jeda") {
-            pinched = false; pinchN = 0; releaseN = 0; dragged = false; wasScroll = false
+            pinched = false; pinchN = 0; releaseN = 0; dragged = false; wasScroll = false; relValid = false
             paint(2); return
         }
 
         if (m == "gulir") {                              // gulir dua jari (opsional)
-            pinched = false; pinchN = 0; releaseN = 0; dragged = false
+            pinched = false; pinchN = 0; releaseN = 0; dragged = false; relValid = false
             val y = (norm[8].y() + norm[12].y()) / 2f
             if (!wasScroll) { wasScroll = true; scrollArmAt = now + 350; anchorY = -1f }
             if (now >= scrollArmAt) {
@@ -668,10 +685,30 @@ class HandService : LifecycleService() {
         val wgt = .65f
         val px = norm[6].x() + (norm[8].x() - norm[6].x()) * wgt
         val py = norm[6].y() + (norm[8].y() - norm[6].y()) * wgt
-        val nx = (((1f - px) - .5f) / (.7f * k) + .5f).coerceIn(0f, 1f)
-        val ny = ((py - .46f) / (.68f * k) + .5f).coerceIn(0f, 1f)
-        val x = snap(((fx.f(nx, now) - .5f) * 1.10f + .5f).coerceIn(0f, 1f) * sw, sw.toFloat())
-        val y = snap(((fy.f(ny, now) - .5f) * 1.10f + .5f).coerceIn(0f, 1f) * sh, sh.toFloat())
+        val x: Float
+        val y: Float
+        if (relative) {
+            // Mode trackpad: kursor mengikuti PERUBAHAN posisi tangan, jadi tangan cukup bergerak kecil
+            // di tengah frame (tidak perlu ke pojok). Kepalkan tangan = "angkat mouse" untuk menggeser ulang.
+            val rx = fx.f(1f - px, now); val ry = fy.f(py, now)
+            if (!relValid) {
+                if (tx >= 0f) { curX = tx; curY = ty } else { curX = sw / 2f; curY = sh / 2f }
+            } else {
+                val dt = max(.001f, (now - relT) / 1000f)
+                val ddx = rx - relX; val ddy = ry - relY
+                val acc = 1f + 1.2f * (hypot(ddx, ddy) / dt).coerceIn(0f, 1f)   // lambat = presisi, cepat = jauh
+                curX = (curX + ddx * sw / (.45f * k) * acc).coerceIn(0f, sw.toFloat())
+                curY = (curY + ddy * sh / (.40f * k) * acc).coerceIn(0f, sh.toFloat())
+            }
+            relX = rx; relY = ry; relT = now; relValid = true
+            x = curX; y = curY
+        } else {
+            val nx = (((1f - px) - .5f) / (.7f * k) + .5f).coerceIn(0f, 1f)
+            val ny = ((py - .46f) / (.68f * k) + .5f).coerceIn(0f, 1f)
+            x = snap(((fx.f(nx, now) - .5f) * 1.10f + .5f).coerceIn(0f, 1f) * sw, sw.toFloat())
+            y = snap(((fy.f(ny, now) - .5f) * 1.10f + .5f).coerceIn(0f, 1f) * sh, sh.toFloat())
+            curX = x; curY = y
+        }
 
         if (!pinched) {
             // setelah klik, kursor ditahan sebentar di titik klik supaya klik ganda tepat sasaran
@@ -722,7 +759,7 @@ class HandService : LifecycleService() {
             }
         }
         kick()
-        paint(if (dragged) 4 else if (pinched) 1 else 0)
+        paint(if (dragged) 4 else if (pinched) 1 else if (ps < pinchClose * 1.5f) 5 else 0)
     }
 }
 EOF
@@ -769,14 +806,14 @@ class MainActivity : Activity() {
             }
             box.addView(label); box.addView(sb); box.addView(text(hint, 12f))
         }
-        fun toggle(title: String, key: String) = Switch(this).apply {
+        fun toggle(title: String, key: String, def: Boolean = false) = Switch(this).apply {
             text = title
-            isChecked = prefs.getBoolean(key, false)
+            isChecked = prefs.getBoolean(key, def)
             setOnCheckedChangeListener { _, c -> prefs.edit().putBoolean(key, c).apply() }
         }
 
         box.addView(text("HandCursor", 28f))
-        box.addView(text("Gerak: acungkan telunjuk. Klik: cubit jempol+telunjuk lalu lepas. Seret/gulir: cubit, tahan, geser tangan. Jeda: kepalkan tangan."))
+        box.addView(text("Gerak: acungkan telunjuk. Klik: cubit jempol+telunjuk lalu lepas. Seret/gulir: cubit, tahan, geser tangan. Jeda: kepalkan tangan (dipakai juga untuk menggeser ulang posisi tangan)."))
         status = text("")
         box.addView(status)
         box.addView(btn("1. Izinkan kamera") {
@@ -806,6 +843,7 @@ class MainActivity : Activity() {
         slider("Sensitivitas cubit", "pinch", "Naikkan kalau cubit sulit terdeteksi. Turunkan kalau terdeteksi padahal tidak mencubit.")
         slider("Jarak mulai seret", "drag", "Naikkan agar seret lebih cepat dimulai. Turunkan kalau klik sering jadi seret.")
         slider("Kecepatan seret", "gain", "Naikkan agar gulir lebih jauh per gerakan tangan.")
+        box.addView(toggle("Mode trackpad (tangan cukup bergerak kecil)", "rel", true))
         box.addView(toggle("Gulir dua jari (alternatif)", "two"))
         box.addView(toggle("Info debug (untuk menyetel)", "dbg"))
         box.addView(btn("Atur ulang sensitivitas") { prefs.edit().clear().apply(); recreate() })
