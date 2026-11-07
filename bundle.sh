@@ -562,14 +562,16 @@ class HandService : LifecycleService() {
                 }
             }
 
-            val mp = BitmapImageBuilder(bmp).build()
-            val res = try { lm.detectForVideo(mp, now) } finally { mp.close() }
+            // JANGAN menutup MPImage: close() ikut me-recycle bitmap, padahal bitmap ini dipakai ulang tiap frame
+            val res = lm.detectForVideo(BitmapImageBuilder(bmp).build(), now)
             errCount = 0
             handle(res, bmp.width, bmp.height, now)
         } catch (e: Exception) {
+            errCount++
+            if (errCount == 12) toast("Gagal memproses kamera: ${e.javaClass.simpleName} ${e.message}")
             // pindah ke CPU hanya kalau error berulang (bukan karena satu frame bermasalah)
-            if (usingGpu && ++errCount >= 5) {
-                usingGpu = false
+            if (usingGpu && errCount >= 5) {
+                usingGpu = false; errCount = 0
                 try { val old = landmarker; landmarker = build(Delegate.CPU); old?.close() } catch (e2: Exception) {}
             }
         } finally {
