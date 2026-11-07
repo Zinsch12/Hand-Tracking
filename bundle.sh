@@ -297,6 +297,9 @@ class HandService : LifecycleService() {
     private var dragX = 0f
     private var dragY = 0f
     private var lastDragT = 0L
+    private val psRing = FloatArray(12) { 1f }
+    private var p3 = 1f
+    private var psIdx = 0
     private var pinchStartT = 0L
     private var lastTapT = 0L
     private var stickyUntil = 0L
@@ -399,7 +402,7 @@ class HandService : LifecycleService() {
         HandLandmarker.HandLandmarkerOptions.builder()
             .setBaseOptions(BaseOptions.builder().setModelAssetPath("hand_landmarker.task").setDelegate(delegate).build())
             .setNumHands(1)
-            .setMinHandDetectionConfidence(.6f).setMinHandPresenceConfidence(.6f).setMinTrackingConfidence(.5f)
+            .setMinHandDetectionConfidence(.5f).setMinHandPresenceConfidence(.4f).setMinTrackingConfidence(.4f)
             .setRunningMode(RunningMode.VIDEO).build())
 
     override fun onCreate() {
@@ -629,7 +632,7 @@ class HandService : LifecycleService() {
 
     private fun resetState() {
         fx.reset(); fy.reset()
-        pinched = false; pinchN = 0; releaseN = 0; dragged = false; ps = 1f
+        pinched = false; pinchN = 0; releaseN = 0; dragged = false; ps = 1f; p3 = 1f
         wasScroll = false; anchorY = -1f; stickyUntil = 0L
         mode = "gerak"; cand = "gerak"; candN = 0
         hist.clear()
@@ -647,8 +650,13 @@ class HandService : LifecycleService() {
         if (norm == null || norm.size < 21) { onLost(now); return }
         // Saring deteksi meragukan: skor rendah, tangan terlalu kecil (latar jauh) atau terlalu besar
         val hs = res.handednesses().firstOrNull()?.firstOrNull()?.score() ?: 1f
-        val hsz = hypot(((norm[0].x() - norm[9].x()) * w).toDouble(), ((norm[0].y() - norm[9].y()) * h).toDouble()).toFloat() / h
-        if (hs < .4f || hsz < .05f || hsz > .55f) { onLost(now); return }
+        var mnX = 1f; var mxX = 0f; var mnY = 1f; var mxY = 0f
+        for (pt in norm) {
+            val a = pt.x(); val b = pt.y()
+            if (a < mnX) mnX = a; if (a > mxX) mxX = a; if (b < mnY) mnY = b; if (b > mxY) mxY = b
+        }
+        val hsz = hypot(((mxX - mnX) * w).toDouble(), ((mxY - mnY) * h).toDouble()).toFloat() / h
+        if (hs < .3f || hsz < .08f || hsz > 1.3f) { onLost(now); return }
         // Buang lonjakan mendadak satu frame (deteksi salah ke objek lain)
         val wx = norm[0].x(); val wy = norm[0].y()
         if (prevT != 0L && now - prevT < 150) {
@@ -664,7 +672,7 @@ class HandService : LifecycleService() {
         val q: List<P> = if (world != null && world.size >= 21) world.map { P(it.x(), it.y(), it.z()) }
         else norm.map { P(it.x() * w, it.y() * h, it.z() * w) }
 
-        val size = max(dist(q[0], q[9]), 1e-6f)
+        val size = max(.5f * (dist(q[0], q[9]) + 1.2f * dist(q[5], q[17])), 1e-6f)
         // Kelurusan jari = jarak pangkal-ujung / panjang tulang jari. ~1.0 lurus, ~0.5 menekuk.
         // Tidak bergantung arah tangan, dan memakai histeresis supaya tidak berkedip.
         fun st(a: Int, b: Int, c: Int, d: Int) =
@@ -677,12 +685,27 @@ class HandService : LifecycleService() {
         }
         val idx = ext[0]; val mid = ext[1]; val rng = ext[2]; val pky = ext[3]
         val sI = sv[0]
-        ps = ps * .4f + (dist(q[4], q[8]) / size) * .6f
-        val openThr = pinchClose * 1.6f
+        // Seberapa telapak menghadap kamera (1 = menghadap, 0 = menyamping), dari normal telapak 3D.
+        val kx = q[5].x - q[0].x; val ky = q[5].y - q[0].y; val kz = q[5].z - q[0].z
+        val lx = q[17].x - q[0].x; val ly = q[17].y - q[0].y; val lz = q[17].z - q[0].z
+        val nX = ky * lz - kz * ly; val nY = kz * lx - kx * lz; val nZ = kx * ly - ky * lx
+        val facing = (abs(nZ) / max(sqrt(nX * nX + nY * nY + nZ * nZ), 1e-9f)).coerceIn(0f, 1f)
+        // Komponen dalam-bidang gambar (x,y) akurat; kedalaman (z) dari model tak pasti dan makin tak
+        // pasti saat tangan menyamping, jadi bobot z diturunkan sebanding. Batas cubit dilonggarkan maks +50%.
+        // Dua skor jarak jempol-telunjuk (dinormalisasi ukuran telapak):
+        //  p3 = jarak 3D penuh (ketat, tapi z dari model berisik),
+        //  ps = kedalaman (z) dibobot 0,4 (longgar; dipakai bersama syarat arah telapak / gerakan menutup).
+        val gx = q[4].x - q[8].x; val gy = q[4].y - q[8].y; val gzr = q[4].z - q[8].z
+        val gzw = gzr * .4f
+        p3 = p3 * .4f + (sqrt(gx * gx + gy * gy + gzr * gzr) / size) * .6f
+        ps = ps * .4f + (sqrt(gx * gx + gy * gy + gzw * gzw) / size) * .6f
+        val pc = pinchClose * (1f + .3f * (1f - facing))
+        val openThr = pc * 1.6f
+        psRing[psIdx] = ps; psIdx = (psIdx + 1) % psRing.size
 
         // Kursor hanya bergerak kalau TELUNJUK terangkat (atau sedang mencubit).
         // Pose lain (kepalan, hanya jari tengah/manis/kelingking terangkat) = jeda.
-        val near = ps < pinchClose * 1.3f || pinched
+        val near = ps < pc * 1.3f || pinched
         val rawMode = when {
             near -> "gerak"
             twoFinger && idx && mid && !rng && !pky -> "gulir"
@@ -693,7 +716,7 @@ class HandService : LifecycleService() {
             lastDbg = now
             fun f(i: Int, n: String) = n + (if (ext[i]) "+" else "-") + "%.2f".format(sv[i])
             val t = f(0, "T") + "  " + f(1, "J") + "  " + f(2, "M") + "  " + f(3, "K") +
-                "\ncubit %.2f (batas %.2f)  mode %s\nterang %.0f  skor %.2f  ukuran %.2f".format(ps, pinchClose, mode, lum, hs, hsz)
+                "\ncubit %.2f/%.2f (batas %.2f)  mode %s\nterang %.0f  skor %.2f  ukuran %.2f  hadap %.2f".format(ps, p3, pc, mode, lum, hs, hsz, facing)
             main.post { dbgView?.text = t }
         }
         val m = vote(rawMode)
@@ -742,7 +765,14 @@ class HandService : LifecycleService() {
             while (hist.isNotEmpty() && now - hist.first().first > 400) hist.removeFirst()
 
             // mulai cubit: harus terdeteksi 2 frame berturut-turut dan telunjuk tidak terlipat penuh
-            if (ps < pinchClose && sI > .55f) pinchN++ else pinchN = 0
+            // Cubit ketat selalu sah. Cubit longgar (khusus tangan menyamping, z tak pasti) hanya sah kalau
+            // jempol baru saja BENAR-BENAR menutup (jaraknya sebelumnya jauh lebih besar), supaya jempol yang
+            // sekadar terhalang telunjuk tidak terbaca sebagai cubit.
+            var pm = 0f
+            for (v in psRing) if (v > pm) pm = v
+            val closing = pm > pc * 2f
+            val okPinch = p3 < pinchClose || (ps < pc && (facing >= .6f || closing))
+            if (okPinch && sI > .45f) pinchN++ else pinchN = 0
             if (pinchN >= 2) {
                 val keep = now < stickyUntil
                 pinched = true; pinchN = 0; releaseN = 0; dragged = false; pinchStartT = now
@@ -757,8 +787,8 @@ class HandService : LifecycleService() {
                 }
             }
         } else {
-            if (ps > openThr) releaseN++ else releaseN = 0
-            if (releaseN >= 2) {                         // lepas cubit
+            if (p3 > pinchClose * 1.6f || ps > openThr) releaseN++ else releaseN = 0   // lepas jika salah satu skor menyatakan terbuka
+            if (releaseN >= (if (facing < .6f) 3 else 2)) {  // lepas cubit (menyamping: 3 frame)
                 if (!dragged && !tappedAtStart) { doTap(ox, oy); lastTapT = now }
                 stickyUntil = if (dragged) 0L else now + 450
                 pinched = false; releaseN = 0; dragged = false
