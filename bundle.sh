@@ -277,9 +277,10 @@ internal class PinchFsm {
     }
 
     /** Frame tidak valid (tangan hilang / terpotong / ditolak penyaring). Hilang bukan berarti masih mencubit. */
-    fun invalid(now: Long): Ev {
+    fun invalid(now: Long, because: String = "tangan hilang"): Ev {
         if (invSince == 0L) invSince = now
-        if (pinchedNow && now - invSince > 300) { reset("tangan hilang > 300 ms"); return Ev.CANCEL }
+        reason = because
+        if (pinchedNow && now - invSince > 300) { reset("$because > 300 ms"); return Ev.CANCEL }
         if (state == S.CANDIDATE) { state = S.IDLE; actN = 0; reason = "kandidat batal: tangan hilang" }
         return Ev.NONE
     }
@@ -340,7 +341,9 @@ internal class PinchFsm {
                     if (relN > 0) { suppressed++; reason = "bukti lepas terputus (diredam)" }
                     relN = 0; state = S.HOLD
                 }
-                relN2 = if (ds > enter * 2.2f) relN2 + 1 else 0     // terbuka lebar searah kedalaman (z)
+                // terbuka lebar searah kedalaman (z): hanya dipercaya saat tangan menyamping (facing < 0,6);
+                // saat menghadap, skor 3D terlalu berisik (z) dan memicu pelepasan palsu
+                relN2 = if (ds > enter * 2.2f && facing < .6f) relN2 + 1 else 0
                 if (relN >= need || relN2 >= need + 1) {
                     reason = if (relN >= need) "lepas: jarak > batas keluar" else "lepas: skor 3D jauh terbuka"
                     state = S.COOLDOWN; coolUntil = now + 120; relN = 0; relN2 = 0; actN = 0
@@ -429,6 +432,11 @@ class HandService : LifecycleService() {
     private var lastProcT = 0L
     private var lastDarkWarn = 0L
     @Volatile private var lum = 128f
+    @Volatile private var satFrac = 0f
+    private var cam: androidx.camera.core.Camera? = null
+    private var expIdx = 0
+    private var lastExpT = 0L
+    private var lastBrightWarn = 0L
     private var prevWx = 0f
     private var prevWy = 0f
     private var prevT = 0L
@@ -587,7 +595,7 @@ class HandService : LifecycleService() {
                 analysis = a
                 refreshMetrics()
                 pv.unbindAll()
-                pv.bindToLifecycle(this@HandService, CameraSelector.DEFAULT_FRONT_CAMERA, a)
+                cam = pv.bindToLifecycle(this@HandService, CameraSelector.DEFAULT_FRONT_CAMERA, a)
             } catch (e: Exception) {
                 toast("Kamera gagal dibuka: ${e.message}"); stopSelf()
             }
@@ -602,6 +610,7 @@ class HandService : LifecycleService() {
 
     override fun onDestroy() {
         stopping = true
+        cam = null
         super.onDestroy()
         try { analysis?.clearAnalyzer() } catch (e: Exception) {}
         try { provider?.unbindAll() } catch (e: Exception) {}
@@ -666,16 +675,29 @@ class HandService : LifecycleService() {
                 bmp = dst
             }
 
-            if (++frameN % 8 == 0) lum = luma(bmp)      // cukup dicek tiap 8 frame
-            if (lum < 70f) {                            // ruangan gelap: terangkan gambar sebelum dideteksi
+            if (++frameN % 8 == 0) { lum = luma(bmp); adjustExposure(now) }      // cukup dicek tiap 8 frame
+            val dark = lum < 70f
+            val bright = lum > 150f || satFrac > .20f
+            if (dark || bright) {
                 var eb = enhBuf
                 if (eb == null || eb.width != bmp.width || eb.height != bmp.height) {
                     eb = Bitmap.createBitmap(bmp.width, bmp.height, Bitmap.Config.ARGB_8888); enhBuf = eb
                 }
-                enhanceInto(bmp, eb, (100f / max(lum, 15f)).coerceIn(1f, 2.8f))
+                if (dark) {
+                    enhanceInto(bmp, eb, (100f / max(lum, 15f)).coerceIn(1f, 2.8f), 0f)          // terangkan
+                } else {
+                    // terlalu terang / cahaya belakang: tangan nyaris sewarna latar. Regangkan kontras dekat putih
+                    // (titik hitam naik sesuai kecerahan) supaya tepi jari kembali terbaca.
+                    val bl = (lum - 90f).coerceIn(0f, 150f)
+                    val sc = 255f / (255f - bl)
+                    enhanceInto(bmp, eb, sc, -bl * sc)
+                }
                 bmp = eb
-                if (lum < 40f && now - lastDarkWarn > 20000) {
+                if (dark && lum < 40f && now - lastDarkWarn > 20000) {
                     lastDarkWarn = now; toast("Ruangan terlalu gelap, pelacakan bisa kurang akurat. Tambah cahaya.")
+                }
+                if (bright && lum > 190f && now - lastBrightWarn > 30000) {
+                    lastBrightWarn = now; toast("Cahaya terlalu terang / dari belakang tangan. Hindari menghadap lampu atau jendela.")
                 }
             }
 
@@ -716,25 +738,47 @@ class HandService : LifecycleService() {
         }
     }
 
+    /**
+     * Turunkan eksposur kamera saat gambar terlalu terang (jauh lebih baik daripada memperbaiki di perangkat
+     * lunak, karena piksel yang sudah putih tidak bisa dipulihkan). Satu langkah per 1,2 detik, dengan zona
+     * mati 95..175 supaya tidak naik-turun terus.
+     */
+    private fun adjustExposure(now: Long) {
+        val c = cam ?: return
+        if (now - lastExpT < 1200) return
+        val r = c.cameraInfo.exposureState.exposureCompensationRange
+        var target = expIdx
+        if (lum > 175f || satFrac > .25f) target = expIdx - 1
+        else if (lum < 95f && expIdx < 0) target = expIdx + 1
+        target = target.coerceIn(max(r.lower, -4), min(r.upper, 0))
+        if (target != expIdx) {
+            expIdx = target; lastExpT = now
+            main.post { try { c.cameraControl.setExposureCompensationIndex(target) } catch (e: Exception) {} }
+        }
+    }
+
     private fun luma(b: Bitmap): Float {
-        var sum = 0f; var n = 0
+        var sum = 0f; var n = 0; var sat = 0
         val sx = max(1, b.width / 24); val sy = max(1, b.height / 32)
         var y = 0
         while (y < b.height) {
             var x = 0
             while (x < b.width) {
                 val c = b.getPixel(x, y)
-                sum += .299f * Color.red(c) + .587f * Color.green(c) + .114f * Color.blue(c); n++
+                val l = .299f * Color.red(c) + .587f * Color.green(c) + .114f * Color.blue(c)
+                sum += l; n++
+                if (l > 245f) sat++
                 x += sx
             }
             y += sy
         }
+        satFrac = if (n > 0) sat.toFloat() / n else 0f
         return if (n > 0) sum / n else 128f
     }
 
-    private fun enhanceInto(src: Bitmap, dst: Bitmap, gain: Float) {
+    private fun enhanceInto(src: Bitmap, dst: Bitmap, gain: Float, offset: Float) {
         enhPaint.colorFilter = ColorMatrixColorFilter(ColorMatrix(floatArrayOf(
-            gain, 0f, 0f, 0f, 0f,  0f, gain, 0f, 0f, 0f,  0f, 0f, gain, 0f, 0f,  0f, 0f, 0f, 1f, 0f)))
+            gain, 0f, 0f, 0f, offset,  0f, gain, 0f, 0f, offset,  0f, 0f, gain, 0f, offset,  0f, 0f, 0f, 1f, 0f)))
         Canvas(dst).drawBitmap(src, 0f, 0f, enhPaint)
     }
 
@@ -754,15 +798,20 @@ class HandService : LifecycleService() {
         paint(0)
     }
 
-    private fun onLost(now: Long) {
-        if (fsm.invalid(now) == PinchFsm.Ev.CANCEL) { pinched = false; dragged = false }   // tangan hilang: batalkan, jangan klik
+    private fun onLost(now: Long, why: String) {
+        if (fsm.invalid(now, why) == PinchFsm.Ev.CANCEL) { pinched = false; dragged = false }   // tangan hilang: batalkan, jangan klik
         if (lostAt == 0L) lostAt = now
+        if (debug && now - lastDbg > 150) {
+            lastDbg = now
+            val t = "TANGAN HILANG: $why\n${now - lostAt} ms  state ${fsm.state.name}\nalasan: ${fsm.reason}\nterang %.0f  jenuh %.0f%%  EV %d".format(lum, satFrac * 100f, expIdx)
+            main.post { dbgView?.text = t }
+        }
         if (now - lostAt > 400) resetState()
     }
 
     private fun handle(res: HandLandmarkerResult, w: Int, h: Int, now: Long) {
         val norm = res.landmarks().firstOrNull()
-        if (norm == null || norm.size < 21) { onLost(now); return }
+        if (norm == null || norm.size < 21) { onLost(now, "model tidak mendeteksi tangan"); return }
         // Saring deteksi meragukan: skor rendah, tangan terlalu kecil (latar jauh) atau terlalu besar
         val hs = res.handednesses().firstOrNull()?.firstOrNull()?.score() ?: 1f
         var mnX = 1f; var mxX = 0f; var mnY = 1f; var mxY = 0f
@@ -771,7 +820,10 @@ class HandService : LifecycleService() {
             if (a < mnX) mnX = a; if (a > mxX) mxX = a; if (b < mnY) mnY = b; if (b > mxY) mxY = b
         }
         val hsz = hypot(((mxX - mnX) * w).toDouble(), ((mxY - mnY) * h).toDouble()).toFloat() / h
-        if (hs < .3f || hsz < .08f || hsz > 1.3f) { onLost(now); return }
+        val gate = if (hs < .3f) "skor tangan rendah (%.2f)".format(hs)
+                   else if (hsz < .08f) "tangan terlalu kecil (%.2f)".format(hsz)
+                   else if (hsz > 1.3f) "tangan terlalu besar (%.2f)".format(hsz) else null
+        if (gate != null) { onLost(now, gate); return }
         // Buang lonjakan mendadak satu frame (deteksi salah ke objek lain)
         val wx = norm[0].x(); val wy = norm[0].y()
         if (prevT != 0L && now - prevT < 150) {
@@ -830,7 +882,7 @@ class HandService : LifecycleService() {
             lastDbg = now
             fun f(i: Int, n: String) = n + (if (ext[i]) "+" else "-") + "%.2f".format(sv[i])
             val t = f(0, "T") + "  " + f(1, "J") + "  " + f(2, "M") + "  " + f(3, "K") +
-                "\nketat %.2f longgar %.2f | masuk<%.2f/%.2f keluar>%.2f  hadap %.2f\nstate %s  aktif %d lepas %d diredam %d menutup %s\nalasan: %s\nmode %s  terang %.0f  skor %.2f  ukuran %.2f".format(fsm.ds, fsm.dw, pinchClose, fsm.relaxedT, fsm.exitT, facing, fsm.state.name, fsm.actN, fsm.relN, fsm.suppressed, if (fsm.closing) "ya" else "tidak", fsm.reason, mode, lum, hs, hsz)
+                "\nketat %.2f longgar %.2f | masuk<%.2f/%.2f keluar>%.2f  hadap %.2f\nstate %s  aktif %d lepas %d diredam %d menutup %s\nalasan: %s\nmode %s  terang %.0f  jenuh %.0f%%  EV %d  skor %.2f  ukuran %.2f".format(fsm.ds, fsm.dw, pinchClose, fsm.relaxedT, fsm.exitT, facing, fsm.state.name, fsm.actN, fsm.relN, fsm.suppressed, if (fsm.closing) "ya" else "tidak", fsm.reason, mode, lum, satFrac * 100f, expIdx, hs, hsz)
             main.post { dbgView?.text = t }
         }
         val m = vote(rawMode)
@@ -880,7 +932,12 @@ class HandService : LifecycleService() {
         }
 
         // 1) KEPUTUSAN: mesin status cubit (bukti masuk/keluar terpisah, histeresis, cooldown)
-        val ev = fsm.update(dsRaw, dwRaw, facing, pinchClose, sI > .45f, now)
+        // Landmark sendi cubit yang menyentuh/keluar tepi frame adalah tebakan model, bukan pengamatan:
+        // jangan dipakai memutuskan cubit (kursor tetap bergerak).
+        fun outside(i: Int) = norm[i].x() < .01f || norm[i].x() > .99f || norm[i].y() < .01f || norm[i].y() > .99f
+        val edgeBad = outside(4) || outside(8) || outside(0) || outside(5) || outside(17)
+        val ev = if (edgeBad) fsm.invalid(now, "landmark cubit di tepi frame")
+                 else fsm.update(dsRaw, dwRaw, facing, pinchClose, sI > .45f, now)
 
         // 2) AKSI: klik / klik ganda / seret bereaksi pada kejadian, bukan pada nilai mentah
         if (ev == PinchFsm.Ev.PRESS) {
@@ -895,6 +952,8 @@ class HandService : LifecycleService() {
             if (keep && now - lastTapT < 450) {          // cubit kedua cepat = ketukan kedua langsung
                 doTap(ox, oy); tappedAtStart = true; lastTapT = now
             }
+        } else if (ev == PinchFsm.Ev.CANCEL) {
+            pinched = false; dragged = false             // tangan hilang/terpotong lama: batalkan tanpa klik
         } else if (ev == PinchFsm.Ev.RELEASE) {
             if (!dragged && !tappedAtStart) { doTap(ox, oy); lastTapT = now }   // tanpa geser = klik saat dilepas
             stickyUntil = if (dragged) 0L else now + 450
