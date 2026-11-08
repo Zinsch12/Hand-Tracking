@@ -200,6 +200,7 @@ import kotlin.math.cos
 import kotlin.math.sin
 import kotlin.math.hypot
 import kotlin.math.max
+import kotlin.math.min
 import kotlin.math.pow
 import kotlin.math.sqrt
 
@@ -231,6 +232,123 @@ class HudView(c: Context) : View(c) {
         if (pinch) { f.alpha = 110; cv.drawCircle(cx, cy, r * .7f, f) }
         f.color = col; f.alpha = 255
         cv.drawCircle(cx, cy, if (pinch) 6f else 4f, f)
+    }
+}
+
+/**
+ * Mesin status cubit. HANYA memutuskan "cubit atau tidak"; aksi klik/seret ada di HandService.
+ *   IDLE -> CANDIDATE -> HOLD <-> RELEASING -> COOLDOWN -> IDLE
+ * Masuk dan keluar memakai bukti BERBEDA (histeresis): keluar butuh jarak jauh di atas batas masuk,
+ * dan bukti lepas harus berturut-turut sehingga satu frame berisik tidak melepas cubit yang ditahan.
+ */
+internal class PinchFsm {
+    enum class S { IDLE, CANDIDATE, HOLD, RELEASING, COOLDOWN }
+    enum class Ev { NONE, PRESS, RELEASE, CANCEL }
+
+    var state = S.IDLE; private set
+    var reason = "-"; private set
+    var actN = 0; private set          // frame bukti-masuk berturut-turut
+    var relN = 0; private set          // frame bukti-lepas berturut-turut
+    var suppressed = 0; private set    // berapa kali bukti lepas terputus (kedipan yang diredam)
+    var exitT = 0f; private set
+    var relaxedT = 0f; private set
+    var closing = false; private set
+    var ds = 0f; private set           // skor ketat setelah median-3
+    var dw = 0f; private set           // skor longgar setelah median-3
+    val pinchedNow: Boolean get() = state == S.HOLD || state == S.RELEASING
+
+    private var why = "-"
+    private var hold = 0f
+    private var relN2 = 0
+    private var coolUntil = 0L
+    private var invSince = 0L
+    private val dh = FloatArray(10); private var dn = 0
+    private val m3 = FloatArray(3); private val mw = FloatArray(3); private var mn = 0
+
+    private fun med3(a: FloatArray, n: Int): Float = when (n) {
+        1 -> a[0]
+        2 -> (a[0] + a[1]) / 2f
+        else -> max(min(a[0], a[1]), min(max(a[0], a[1]), a[2]))
+    }
+
+    fun reset(because: String) {
+        state = S.IDLE; actN = 0; relN = 0; relN2 = 0; coolUntil = 0L; invSince = 0L
+        dn = 0; mn = 0; hold = 0f; reason = because
+    }
+
+    /** Frame tidak valid (tangan hilang / terpotong / ditolak penyaring). Hilang bukan berarti masih mencubit. */
+    fun invalid(now: Long): Ev {
+        if (invSince == 0L) invSince = now
+        if (pinchedNow && now - invSince > 300) { reset("tangan hilang > 300 ms"); return Ev.CANCEL }
+        if (state == S.CANDIDATE) { state = S.IDLE; actN = 0; reason = "kandidat batal: tangan hilang" }
+        return Ev.NONE
+    }
+
+    private fun evidence(enter: Float, facing: Float, idxOk: Boolean): Boolean {
+        if (!idxOk) { why = "telunjuk terlipat penuh"; return false }
+        val strict = ds < enter
+        val relaxedOk = dw < relaxedT && (facing >= .6f || closing)
+        why = if (strict) "skor ketat < batas masuk"
+              else if (relaxedOk) (if (facing >= .6f) "skor longgar (telapak menghadap)" else "skor longgar + menutup")
+              else "-"
+        return strict || relaxedOk
+    }
+
+    private fun press(): Ev {
+        state = S.HOLD; hold = dw; relN = 0; relN2 = 0; reason = "cubit terkonfirmasi: $why"; return Ev.PRESS
+    }
+
+    fun update(r3: Float, rw: Float, facing: Float, enter: Float, idxOk: Boolean, now: Long): Ev {
+        invSince = 0L
+        // median-3 menyaring landmark yang meleset satu frame
+        if (mn < 3) { m3[mn] = r3; mw[mn] = rw; mn++ }
+        else { m3[0] = m3[1]; m3[1] = m3[2]; m3[2] = r3; mw[0] = mw[1]; mw[1] = mw[2]; mw[2] = rw }
+        ds = med3(m3, mn); dw = med3(mw, mn)
+        if (dn < dh.size) { dh[dn++] = dw } else { System.arraycopy(dh, 1, dh, 0, dh.size - 1); dh[dh.size - 1] = dw }
+        relaxedT = enter * (1f + .3f * (1f - facing))
+        // "menutup" = jarak baru saja turun jauh (bukti berbatas 10 frame) dan sekarang tidak sedang naik
+        closing = false
+        if (dn >= 6) {
+            var mx = 0f
+            for (i in 0 until dn - 3) if (dh[i] > mx) mx = dh[i]
+            closing = (mx - dw) > .30f && dw <= dh[dn - 2] + .02f
+        }
+        val need = if (facing < .6f) 3 else 2
+
+        when (state) {
+            S.IDLE, S.COOLDOWN -> {
+                if (state == S.COOLDOWN) {
+                    if (now < coolUntil) { reason = "cooldown"; return Ev.NONE }
+                    state = S.IDLE
+                }
+                if (evidence(enter, facing, idxOk)) { actN = 1; state = S.CANDIDATE; reason = "kandidat: $why" }
+                return Ev.NONE
+            }
+            S.CANDIDATE -> {
+                if (evidence(enter, facing, idxOk)) {
+                    actN++
+                    if (actN >= need) return press()
+                } else { state = S.IDLE; actN = 0; reason = "kandidat batal: bukti hilang" }
+                return Ev.NONE
+            }
+            else -> {                                   // HOLD atau RELEASING
+                hold += .1f * (dw - hold)               // acuan jarak selama ditahan
+                // batas keluar: selalu di atas batas masuk, tapi mengikuti acuan supaya pelepasan tidak telat
+                exitT = max(relaxedT * 1.15f, min(relaxedT * 1.35f, hold + .22f))
+                if (dw > exitT) { relN++; state = S.RELEASING; reason = "bukti lepas $relN/$need" }
+                else {
+                    if (relN > 0) { suppressed++; reason = "bukti lepas terputus (diredam)" }
+                    relN = 0; state = S.HOLD
+                }
+                relN2 = if (ds > enter * 2.2f) relN2 + 1 else 0     // terbuka lebar searah kedalaman (z)
+                if (relN >= need || relN2 >= need + 1) {
+                    reason = if (relN >= need) "lepas: jarak > batas keluar" else "lepas: skor 3D jauh terbuka"
+                    state = S.COOLDOWN; coolUntil = now + 120; relN = 0; relN2 = 0; actN = 0
+                    return Ev.RELEASE
+                }
+                return Ev.NONE
+            }
+        }
     }
 }
 
@@ -288,8 +406,7 @@ class HandService : LifecycleService() {
     private var hasDisp = false
 
     private var pinched = false
-    private var pinchN = 0
-    private var releaseN = 0
+    private val fsm = PinchFsm()
     private var ps = 1f
     private var dragged = false
     private var ox = 0f
@@ -297,9 +414,6 @@ class HandService : LifecycleService() {
     private var dragX = 0f
     private var dragY = 0f
     private var lastDragT = 0L
-    private val psRing = FloatArray(12) { 1f }
-    private var p3 = 1f
-    private var psIdx = 0
     private var pinchStartT = 0L
     private var lastTapT = 0L
     private var stickyUntil = 0L
@@ -632,7 +746,7 @@ class HandService : LifecycleService() {
 
     private fun resetState() {
         fx.reset(); fy.reset()
-        pinched = false; pinchN = 0; releaseN = 0; dragged = false; ps = 1f; p3 = 1f
+        pinched = false; dragged = false; ps = 1f; fsm.reset("reset")
         wasScroll = false; anchorY = -1f; stickyUntil = 0L
         mode = "gerak"; cand = "gerak"; candN = 0
         hist.clear()
@@ -641,6 +755,7 @@ class HandService : LifecycleService() {
     }
 
     private fun onLost(now: Long) {
+        if (fsm.invalid(now) == PinchFsm.Ev.CANCEL) { pinched = false; dragged = false }   // tangan hilang: batalkan, jangan klik
         if (lostAt == 0L) lostAt = now
         if (now - lostAt > 400) resetState()
     }
@@ -693,15 +808,14 @@ class HandService : LifecycleService() {
         // Komponen dalam-bidang gambar (x,y) akurat; kedalaman (z) dari model tak pasti dan makin tak
         // pasti saat tangan menyamping, jadi bobot z diturunkan sebanding. Batas cubit dilonggarkan maks +50%.
         // Dua skor jarak jempol-telunjuk (dinormalisasi ukuran telapak):
-        //  p3 = jarak 3D penuh (ketat, tapi z dari model berisik),
-        //  ps = kedalaman (z) dibobot 0,4 (longgar; dipakai bersama syarat arah telapak / gerakan menutup).
+        //  dsRaw = jarak 3D penuh (ketat, tapi z dari model berisik),
+        //  dwRaw = kedalaman (z) dibobot 0,4 (longgar; dipakai bersama syarat arah telapak / gerakan menutup).
         val gx = q[4].x - q[8].x; val gy = q[4].y - q[8].y; val gzr = q[4].z - q[8].z
         val gzw = gzr * .4f
-        p3 = p3 * .4f + (sqrt(gx * gx + gy * gy + gzr * gzr) / size) * .6f
-        ps = ps * .4f + (sqrt(gx * gx + gy * gy + gzw * gzw) / size) * .6f
+        val dsRaw = sqrt(gx * gx + gy * gy + gzr * gzr) / size
+        val dwRaw = sqrt(gx * gx + gy * gy + gzw * gzw) / size
+        ps = ps * .4f + dwRaw * .6f          // hanya untuk klasifikasi mode (near); keputusan cubit ada di PinchFsm
         val pc = pinchClose * (1f + .3f * (1f - facing))
-        val openThr = pc * 1.6f
-        psRing[psIdx] = ps; psIdx = (psIdx + 1) % psRing.size
 
         // Kursor hanya bergerak kalau TELUNJUK terangkat (atau sedang mencubit).
         // Pose lain (kepalan, hanya jari tengah/manis/kelingking terangkat) = jeda.
@@ -716,18 +830,18 @@ class HandService : LifecycleService() {
             lastDbg = now
             fun f(i: Int, n: String) = n + (if (ext[i]) "+" else "-") + "%.2f".format(sv[i])
             val t = f(0, "T") + "  " + f(1, "J") + "  " + f(2, "M") + "  " + f(3, "K") +
-                "\ncubit %.2f/%.2f (batas %.2f)  mode %s\nterang %.0f  skor %.2f  ukuran %.2f  hadap %.2f".format(ps, p3, pc, mode, lum, hs, hsz, facing)
+                "\nketat %.2f longgar %.2f | masuk<%.2f/%.2f keluar>%.2f  hadap %.2f\nstate %s  aktif %d lepas %d diredam %d menutup %s\nalasan: %s\nmode %s  terang %.0f  skor %.2f  ukuran %.2f".format(fsm.ds, fsm.dw, pinchClose, fsm.relaxedT, fsm.exitT, facing, fsm.state.name, fsm.actN, fsm.relN, fsm.suppressed, if (fsm.closing) "ya" else "tidak", fsm.reason, mode, lum, hs, hsz)
             main.post { dbgView?.text = t }
         }
         val m = vote(rawMode)
 
         if (m == "jeda") {
-            pinched = false; pinchN = 0; releaseN = 0; dragged = false; wasScroll = false
+            fsm.reset("mode jeda"); pinched = false; dragged = false; wasScroll = false
             paint(2); return
         }
 
         if (m == "gulir") {                              // gulir dua jari (opsional)
-            pinched = false; pinchN = 0; releaseN = 0; dragged = false
+            fsm.reset("mode gulir"); pinched = false; dragged = false
             val y = (norm[8].y() + norm[12].y()) / 2f
             if (!wasScroll) { wasScroll = true; scrollArmAt = now + 350; anchorY = -1f }
             if (now >= scrollArmAt) {
@@ -763,48 +877,41 @@ class HandService : LifecycleService() {
             }
             hist.addLast(Triple(now, x, y))
             while (hist.isNotEmpty() && now - hist.first().first > 400) hist.removeFirst()
+        }
 
-            // mulai cubit: harus terdeteksi 2 frame berturut-turut dan telunjuk tidak terlipat penuh
-            // Cubit ketat selalu sah. Cubit longgar (khusus tangan menyamping, z tak pasti) hanya sah kalau
-            // jempol baru saja BENAR-BENAR menutup (jaraknya sebelumnya jauh lebih besar), supaya jempol yang
-            // sekadar terhalang telunjuk tidak terbaca sebagai cubit.
-            var pm = 0f
-            for (v in psRing) if (v > pm) pm = v
-            val closing = pm > pc * 2f
-            val okPinch = p3 < pinchClose || (ps < pc && (facing >= .6f || closing))
-            if (okPinch && sI > .45f) pinchN++ else pinchN = 0
-            if (pinchN >= 2) {
-                val keep = now < stickyUntil
-                pinched = true; pinchN = 0; releaseN = 0; dragged = false; pinchStartT = now
-                if (!keep) {
-                    val hh = hist.firstOrNull { now - it.first <= 200 } ?: hist.lastOrNull()
-                    ox = hh?.second ?: x; oy = hh?.third ?: y
-                }
-                tx = ox; ty = oy; dragX = ox; dragY = oy; lastDragT = now
-                tappedAtStart = false
-                if (keep && now - lastTapT < 450) {      // cubit kedua cepat = ketukan kedua langsung
-                    doTap(ox, oy); tappedAtStart = true; lastTapT = now
-                }
+        // 1) KEPUTUSAN: mesin status cubit (bukti masuk/keluar terpisah, histeresis, cooldown)
+        val ev = fsm.update(dsRaw, dwRaw, facing, pinchClose, sI > .45f, now)
+
+        // 2) AKSI: klik / klik ganda / seret bereaksi pada kejadian, bukan pada nilai mentah
+        if (ev == PinchFsm.Ev.PRESS) {
+            val keep = now < stickyUntil
+            pinched = true; dragged = false; pinchStartT = now
+            if (!keep) {
+                val hh = hist.firstOrNull { now - it.first <= 200 } ?: hist.lastOrNull()
+                ox = hh?.second ?: x; oy = hh?.third ?: y
             }
-        } else {
-            if (p3 > pinchClose * 1.6f || ps > openThr) releaseN++ else releaseN = 0   // lepas jika salah satu skor menyatakan terbuka
-            if (releaseN >= (if (facing < .6f) 3 else 2)) {  // lepas cubit (menyamping: 3 frame)
-                if (!dragged && !tappedAtStart) { doTap(ox, oy); lastTapT = now }
-                stickyUntil = if (dragged) 0L else now + 450
-                pinched = false; releaseN = 0; dragged = false
-            } else {
-                // cubit singkat butuh geseran jauh lebih besar untuk dianggap seret
-                val thr = if (now - pinchStartT < 250) dragThr * 2.5f else dragThr
-                if (!dragged && hypot(x - ox, y - oy) > thr) { dragged = true; dragX = ox; dragY = oy }
-                if (dragged) {                           // cubit + geser = seret / gulir
-                    tx = x; ty = y
-                    if (now - lastDragT > 120) {
-                        val ex = (dragX + (x - dragX) * dragGain).coerceIn(2f, sw - 2f)
-                        val ey = (dragY + (y - dragY) * dragGain).coerceIn(2f, sh - 2f)
-                        if (hypot(ex - dragX, ey - dragY) > 25f) {
-                            GestureService.swipe(dragX, dragY, ex, ey, 100)
-                            dragX = x; dragY = y; lastDragT = now
-                        }
+            tx = ox; ty = oy; dragX = ox; dragY = oy; lastDragT = now
+            tappedAtStart = false
+            if (keep && now - lastTapT < 450) {          // cubit kedua cepat = ketukan kedua langsung
+                doTap(ox, oy); tappedAtStart = true; lastTapT = now
+            }
+        } else if (ev == PinchFsm.Ev.RELEASE) {
+            if (!dragged && !tappedAtStart) { doTap(ox, oy); lastTapT = now }   // tanpa geser = klik saat dilepas
+            stickyUntil = if (dragged) 0L else now + 450
+            pinched = false; dragged = false
+        }
+        if (pinched) {
+            // cubit singkat butuh geseran jauh lebih besar untuk dianggap seret
+            val thr = if (now - pinchStartT < 250) dragThr * 2.5f else dragThr
+            if (!dragged && hypot(x - ox, y - oy) > thr) { dragged = true; dragX = ox; dragY = oy }
+            if (dragged) {                               // cubit + geser = seret / gulir
+                tx = x; ty = y
+                if (now - lastDragT > 120) {
+                    val ex = (dragX + (x - dragX) * dragGain).coerceIn(2f, sw - 2f)
+                    val ey = (dragY + (y - dragY) * dragGain).coerceIn(2f, sh - 2f)
+                    if (hypot(ex - dragX, ey - dragY) > 25f) {
+                        GestureService.swipe(dragX, dragY, ex, ey, 100)
+                        dragX = x; dragY = y; lastDragT = now
                     }
                 }
             }
